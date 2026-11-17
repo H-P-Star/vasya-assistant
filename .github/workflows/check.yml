@@ -28,6 +28,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: ./scripts/prepare-bundle.ps1
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
       - run: npm run tauri build

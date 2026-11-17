@@ -20,6 +20,7 @@ struct StartupErrors(Mutex<Vec<String>>);
 
 #[derive(Serialize)]
 struct Bootstrap {
+    speech_ready: bool,
     settings: Settings,
     muted: bool,
     busy: bool,
@@ -33,6 +34,16 @@ struct Bootstrap {
 #[tauri::command]
 fn get_state(runtime: State<'_, Runtime>, errors: State<'_, StartupErrors>) -> Bootstrap {
     Bootstrap {
+        speech_ready: {
+            let s = config::resolve_speech(
+                &runtime.shared.snapshot(),
+                &runtime.shared.resources.read().unwrap(),
+            );
+            std::path::Path::new(&s.vosk_library).is_file()
+                && std::path::Path::new(&s.vosk_model)
+                    .join("am/final.mdl")
+                    .is_file()
+        },
         settings: runtime.shared.snapshot(),
         muted: runtime.shared.muted.load(SeqCst),
         busy: runtime.shared.busy.load(SeqCst),
@@ -50,6 +61,39 @@ async fn list_microphones() -> Result<Vec<String>, String> {
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn test_microphone(microphone: String) -> Result<f32, String> {
+    tauri::async_runtime::spawn_blocking(move || audio::measure_input(&microphone))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            format!("{e:#}. Проверьте доступ к микрофону в параметрах конфиденциальности Windows.")
+        })
+}
+
+#[tauri::command]
+fn finish_setup(
+    microphone: String,
+    app: tauri::AppHandle,
+    runtime: State<'_, Runtime>,
+) -> Result<(), String> {
+    let mut settings = runtime.shared.snapshot();
+    let resolved = config::resolve_speech(&settings, &runtime.shared.resources.read().unwrap());
+    if !std::path::Path::new(&resolved.vosk_library).is_file()
+        || !std::path::Path::new(&resolved.vosk_model)
+            .join("am/final.mdl")
+            .is_file()
+    {
+        return Err("Компоненты распознавания повреждены или отсутствуют. Переустановите приложение из полного установщика.".into());
+    }
+    settings.microphone = microphone;
+    settings.onboarding_complete = true;
+    let muted = settings.start_muted;
+    save_settings(settings, app, runtime.clone())?;
+    runtime.shared.set_muted(muted);
+    Ok(())
 }
 
 #[tauri::command]
@@ -268,8 +312,12 @@ pub fn run() {
                 }
                 let _ = handle.emit("assistant", event);
             });
-            let runtime =
-                Runtime::start(settings.clone(), Arc::new(crate::platform::Windows), sink);
+            let runtime = Runtime::start_with_resources(
+                settings.clone(),
+                Arc::new(crate::platform::Windows),
+                sink,
+                app.path().resource_dir()?,
+            );
             app.manage(runtime);
             if let Err(error) = apply_hotkey(app.handle(), None, &settings) {
                 app.state::<StartupErrors>()
@@ -325,7 +373,10 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-            if settings.start_in_tray && app.state::<StartupErrors>().0.lock().unwrap().is_empty() {
+            if settings.onboarding_complete
+                && settings.start_in_tray
+                && app.state::<StartupErrors>().0.lock().unwrap().is_empty()
+            {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;
                 }
@@ -347,7 +398,9 @@ pub fn run() {
             open_music_login,
             insert_result,
             save_settings,
-            check_llm
+            check_llm,
+            test_microphone,
+            finish_setup
         ])
         .build(tauri::generate_context!())
         .expect("Не удалось запустить Васю")

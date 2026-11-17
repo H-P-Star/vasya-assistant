@@ -4,6 +4,7 @@ import './style.css';
 
 type Activation = 'wake' | 'hotkey' | 'both';
 type Settings = {
+  onboarding_complete: boolean;
   wake_words: string[]; activation: Activation; hotkey: string; microphone: string;
   vosk_library: string; vosk_model: string; speech_mode: 'vosk' | 'whisper';
   whisper_executable: string; whisper_model: string; music_service: string; browser: string;
@@ -11,18 +12,19 @@ type Settings = {
   llm_provider: 'lm_studio' | 'ollama'; llm_url: string; llm_model: string;
   aliases: {phrase: string; action: string; payload: string}[];
 };
-type Snapshot = {settings: Settings; muted: boolean; busy: boolean; capture_open: boolean;
+type Snapshot = {speech_ready: boolean; settings: Settings; muted: boolean; busy: boolean; capture_open: boolean;
   data_directory: string; errors: string[]; status: string; last_error: string | null};
 type AssistantEvent = {kind: string; text: string; level: number};
 
 const native = isTauri();
 let settings: Settings = {
-  wake_words: ['вась', 'вася'], activation: 'both', hotkey: 'Ctrl+Alt+Space', microphone: '',
+  onboarding_complete: false, wake_words: ['вась', 'вася'], activation: 'both', hotkey: 'Ctrl+Alt+Space', microphone: '',
   vosk_library: '', vosk_model: '', speech_mode: 'vosk', whisper_executable: '', whisper_model: '',
   music_service: 'yandex', browser: 'edge', voice_feedback: true, start_muted: false,
   start_in_tray: false, command_timeout: 10, llm_provider: 'lm_studio', llm_url: 'http://198.18.0.1:1234',
   llm_model: 'google/gemma-3-4b', aliases: [],
 };
+let speechReady = false;
 let muted = false;
 let busy = false;
 let captureOpen = false;
@@ -124,6 +126,36 @@ function render() {
   document.querySelectorAll('[data-page]').forEach(button => button.classList.toggle('active', (button as HTMLElement).dataset.page === page));
   const errorMarkup = '<div id="error" class="error-box" role="alert" hidden><span></span><button id="dismiss-error" aria-label="Скрыть ошибку">×</button></div>';
   const top = (title: string, description: string) => `<header class="page-header"><div><span class="eyebrow">ЛИЧНЫЙ ГОЛОСОВОЙ ПОМОЩНИК</span><h1>${title}</h1><p>${description}</p></div><span class="local-badge"><i></i> Локально</span></header>${errorMarkup}`;
+  if (page === 'home' && !settings.onboarding_complete) {
+    $('content').innerHTML = top('Давайте познакомимся.', 'Два шага — и можно говорить с Васей.') + `
+      <section class="settings-card"><h2>1. Выберите микрофон</h2>
+      <p>Компоненты русского распознавания ${speechReady ? 'установлены вместе с приложением' : 'пока не найдены — переустановите полную версию Васи'}. Интернет для распознавания не нужен.</p>
+      <label class="field">Микрофон<select id="microphone"></select></label>
+      <button id="test-mic" class="secondary">Проверить микрофон · 2 секунды</button><p id="mic-test" role="status">Нажмите кнопку и произнесите несколько слов. Команды во время проверки не выполняются.</p>
+      <h2>2. Начните пользоваться</h2><p>Скажите «Вася, громче» или нажмите <kbd>${esc(settings.hotkey)}</kbd> и скажите «найди погоду».</p>
+      <p>Для музыки выберите сервис в настройках и войдите в аккаунт. Генерацию текста через LM Studio или Ollama можно подключить позже — обычные команды работают без них.</p>
+      <button id="finish-setup" class="primary" ${native && speechReady ? '' : 'disabled'}>Начать пользоваться</button></section>`;
+    fillDevices();
+    $('test-mic').onclick = async () => {
+      if (!native) { toast('Проверка доступна в установленном приложении'); return; }
+      const button = $('test-mic') as HTMLButtonElement;
+      button.disabled = true; $('mic-test').textContent = 'Микрофон включён на 2 секунды. Говорите…';
+      try {
+        const level = await invoke<number>('test_microphone', {microphone: ($('microphone') as HTMLSelectElement).value});
+        $('mic-test').textContent = level > 0.005 ? 'Звук получен. Микрофон работает.' : 'Звук очень тихий. Проверьте устройство и громкость микрофона.';
+      } catch (e) { $('mic-test').textContent = String(e); }
+      finally { button.disabled = false; }
+    };
+    $('finish-setup').onclick = async () => {
+      try {
+        await invoke('finish_setup', {microphone: ($('microphone') as HTMLSelectElement).value});
+        const state = await invoke<Snapshot>('get_state');
+        settings = state.settings; muted = state.muted; error = ''; render();
+      } catch (e) { error = String(e); showError(); }
+    };
+    showError(); $('dismiss-error').onclick = () => { error = ''; showError(); };
+    return;
+  }
   if (page === 'home') {
     $('content').innerHTML = top('Привет. Я Вася.', 'Помогу с музыкой, поиском и текстом. Просто позовите.') + `
       <section class="listen-card" aria-label="Состояние помощника">
@@ -194,7 +226,7 @@ function render() {
     updateWhisper();
   } else {
     $('content').innerHTML = top('Скажите — и готово.', 'Справочник команд и короткая инструкция по запуску.') + `
-      <section class="help-card"><h2>Первый запуск</h2><ol><li>Выполните <code>scripts/prepare-models.ps1</code> из проекта. Скрипт загрузит Vosk и русскую модель.</li><li>Выберите микрофон в настройках и сохраните их.</li><li>Для генерации запустите сервер LM Studio с моделью <code>google/gemma-3-4b</code>. Проверьте подключение в настройках; альтернативно можно выбрать Ollama.</li><li>Для музыки нажмите «Войти в сервис» в настройках. Музыкальный профиль браузера хранится отдельно.</li></ol></section>
+      <section class="help-card"><h2>Первый запуск</h2><ol><li>Установите Васю из полного установщика .exe в GitHub Releases. Vosk и русская модель уже включены.</li><li>При первом запуске выберите и проверьте микрофон, затем нажмите «Начать пользоваться».</li><li>Для генерации запустите сервер LM Studio с моделью <code>google/gemma-3-4b</code>. Проверьте подключение в настройках; альтернативно можно выбрать Ollama.</li><li>Для музыки нажмите «Войти в сервис» в настройках. Музыкальный профиль браузера хранится отдельно.</li></ol></section>
       <section class="help-card"><h2>Команды</h2><table><thead><tr><th>Задача</th><th>После «Вась» или горячей клавиши</th></tr></thead><tbody>
       ${[
         ['Музыка', 'включи трек Перемен / исполнителя Кино / плейлист Работа'],
@@ -224,9 +256,9 @@ function settingsForm() {
     <div class="check-grid"><label><input type="checkbox" id="voice_feedback"/> Голосовое подтверждение</label><label><input type="checkbox" id="start_muted"/> Запускать с выключенным микрофоном</label><label><input type="checkbox" id="start_in_tray"/> Открывать сразу в трее</label></div></section>
     <section class="settings-card"><div class="card-title">${icon('shield')}<h2>Распознавание речи</h2><span class="tag">Локально</span></div>
     <label class="field">Режим<select id="speech_mode"><option value="vosk">Vosk — быстрые команды и диктовка</option><option value="whisper">Vosk + Whisper — уточнение активированных фраз</option></select></label>
-    ${field('vosk_library', 'Библиотека Vosk', 'Полный путь к libvosk.dll из Windows x64 архива Vosk')}${field('vosk_model', 'Папка модели Vosk', 'Распакованная русская модель, например vosk-model-small-ru-0.22')}
+    ${field('vosk_library', 'Библиотека Vosk', 'Оставьте пустым для встроенной библиотеки')}${field('vosk_model', 'Папка модели Vosk', 'Оставьте пустым для встроенной русской модели')}
     <div id="whisper-fields">${field('whisper_executable', 'Путь к whisper-cli.exe')}${field('whisper_model', 'Файл модели Whisper', 'Локальный ggml-base.bin или другая многоязычная модель whisper.cpp')}</div>
-    <p class="form-note">Vosk нужен в обоих режимах для активации и определения границ фраз. Модели не скачиваются без вашего действия.</p></section>
+    <p class="form-note">Vosk нужен в обоих режимах для активации и определения границ фраз. Базовая русская модель включена в установщик; Whisper настраивается дополнительно.</p></section>
     <section class="settings-card"><div class="card-title">${icon('music')}<h2>Музыка и браузер</h2></div><div class="form-grid"><label class="field">Основной сервис<select id="music_service"><option value="yandex">Яндекс Музыка</option><option value="youtube">YouTube</option><option value="spotify">Spotify</option></select></label><label class="field">Браузер музыкального профиля<select id="browser"><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option></select></label></div>
     <button id="login" type="button" class="secondary">Войти в сервис ${icon('arrow', 16)}</button><p class="form-note">Сначала сохраните выбранный сервис. Музыка использует отдельный профиль браузера. Поиск и YouTube открываются в браузере по умолчанию.</p></section>
     <section class="settings-card"><div class="card-title">${icon('key')}<h2>Генерация текста</h2><span class="tag">Своя модель</span></div><label class="field">Провайдер<select id="llm_provider"><option value="lm_studio">LM Studio (совместимый API)</option><option value="ollama">Ollama</option></select></label><div class="form-grid">${field('llm_url', 'Адрес сервера', 'Без /v1 — путь добавляется автоматически')}${field('llm_model', 'Идентификатор модели')}</div><button id="check-llm" type="button" class="secondary">Проверить соединение ${icon('arrow', 16)}</button><p id="llm-models" class="form-note"></p><p class="form-note">Текст запросов «пиши/напиши» отправляется на указанный сервер. Обычные команды и аудио туда не отправляются.</p></section>
@@ -299,12 +331,13 @@ async function connect() {
   });
   const initial = await call<Snapshot>('get_state');
   if (initial) {
-    settings = initial.settings; muted = initial.muted; busy = initial.busy; captureOpen = initial.capture_open;
+    speechReady = initial.speech_ready; settings = initial.settings; muted = initial.muted; busy = initial.busy; captureOpen = initial.capture_open;
     status = initial.status; dataDirectory = initial.data_directory;
     error = [...initial.errors, ...(initial.last_error ? [initial.last_error] : [])].join('\n');
     render();
   }
   await refreshDevices();
+  if (!settings.onboarding_complete && page === 'home') render();
   setInterval(async () => {
     try {
       const state = await invoke<Snapshot>('get_state');

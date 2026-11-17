@@ -23,6 +23,66 @@ pub fn devices() -> Result<Vec<String>> {
         .collect())
 }
 
+/// Short, explicit microphone check; no recognizer or command execution runs here.
+pub fn measure_input(name: &str) -> Result<f32> {
+    use std::sync::atomic::AtomicU32;
+    let host = cpal::default_host();
+    let device = if name.is_empty() {
+        host.default_input_device()
+    } else {
+        host.input_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(name))
+    }
+    .context("Микрофон не найден")?;
+    let config = device.default_input_config()?;
+    let peak = Arc::new(AtomicU32::new(0));
+    let failed = Arc::new(std::sync::Mutex::new(None));
+    fn build<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        peak: Arc<AtomicU32>,
+        failed: Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Result<cpal::Stream>
+    where
+        T: cpal::SizedSample,
+        f32: cpal::FromSample<T>,
+    {
+        Ok(device.build_input_stream(
+            config,
+            move |samples: &[T], _| {
+                let level = samples
+                    .iter()
+                    .map(|s| s.to_sample::<f32>().abs())
+                    .fold(0.0f32, f32::max);
+                peak.fetch_max(level.to_bits(), SeqCst);
+            },
+            move |error| {
+                *failed.lock().unwrap() = Some(error.to_string());
+            },
+            Some(Duration::from_secs(3)),
+        )?)
+    }
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => {
+            build::<f32>(&device, &config.into(), peak.clone(), failed.clone())?
+        }
+        cpal::SampleFormat::I16 => {
+            build::<i16>(&device, &config.into(), peak.clone(), failed.clone())?
+        }
+        cpal::SampleFormat::U16 => {
+            build::<u16>(&device, &config.into(), peak.clone(), failed.clone())?
+        }
+        _ => bail!("Неподдерживаемый формат микрофона"),
+    };
+    stream.play()?;
+    std::thread::sleep(Duration::from_secs(2));
+    drop(stream);
+    if let Some(error) = failed.lock().unwrap().take() {
+        bail!("{error}");
+    }
+    Ok(f32::from_bits(peak.load(SeqCst)))
+}
+
 /// Stateful linear resampling, including phase across arbitrary callback boundaries.
 struct Resampler {
     ratio: f64,
@@ -133,6 +193,13 @@ fn stream(settings: &Settings, state: Arc<Shared>) -> Result<(cpal::Stream, Rece
 
 pub fn run(state: Arc<Shared>, sender: SyncSender<Task>) {
     while !state.stop.load(SeqCst) {
+        if !state.snapshot().onboarding_complete {
+            state.emit("status", "Завершите первый запуск");
+            while !state.stop.load(SeqCst) && !state.snapshot().onboarding_complete {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            continue;
+        }
         let version = state.config_version.load(SeqCst);
         if let Err(error) = session(&state, &sender, version) {
             state.capture_open.store(false, SeqCst);
@@ -147,7 +214,8 @@ pub fn run(state: Arc<Shared>, sender: SyncSender<Task>) {
 }
 
 fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Result<()> {
-    let settings = state.snapshot();
+    let settings =
+        crate::config::resolve_speech(&state.snapshot(), &state.resources.read().unwrap());
     state.emit("status", "Загружаю локальную модель");
     let mut vosk = Vosk::load(
         Path::new(&settings.vosk_library),

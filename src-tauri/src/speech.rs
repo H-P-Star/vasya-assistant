@@ -29,7 +29,7 @@ impl Vosk {
     pub fn load(library: &Path, model: &Path, sample_rate: f32) -> Result<Self> {
         if !library.is_file() {
             bail!(
-                "Не найдена библиотека Vosk. Выполните scripts/prepare-models.ps1 или укажите DLL."
+                "Не найдены компоненты распознавания. Переустановите Васю из полного установщика."
             );
         }
         if !model.is_dir() {

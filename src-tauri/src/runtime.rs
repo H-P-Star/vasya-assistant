@@ -26,6 +26,7 @@ pub trait Platform: Send + Sync + 'static {
 }
 
 pub struct Shared {
+    pub resources: RwLock<std::path::PathBuf>,
     pub settings: RwLock<Settings>,
     pub muted: AtomicBool,
     pub busy: AtomicBool,
@@ -71,6 +72,7 @@ impl Shared {
         self.stop.load(SeqCst) || self.epoch.load(SeqCst) != epoch
     }
     pub fn set_muted(&self, muted: bool) {
+        let muted = muted || !self.snapshot().onboarding_complete;
         self.muted.store(muted, SeqCst);
         self.epoch.fetch_add(1, SeqCst);
         self.activate.store(false, SeqCst);
@@ -129,8 +131,18 @@ impl Runtime {
         platform: Arc<dyn Platform>,
         sink: Arc<dyn Fn(Event) + Send + Sync>,
     ) -> Self {
+        Self::start_with_resources(settings, platform, sink, crate::config::data_dir())
+    }
+
+    pub fn start_with_resources(
+        settings: Settings,
+        platform: Arc<dyn Platform>,
+        sink: Arc<dyn Fn(Event) + Send + Sync>,
+        resources: std::path::PathBuf,
+    ) -> Self {
         let shared = Arc::new(Shared {
-            muted: AtomicBool::new(settings.start_muted),
+            resources: RwLock::new(resources),
+            muted: AtomicBool::new(settings.start_muted || !settings.onboarding_complete),
             settings: RwLock::new(settings),
             busy: AtomicBool::new(false),
             dictating: AtomicBool::new(false),

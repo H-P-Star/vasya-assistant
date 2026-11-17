@@ -35,6 +35,7 @@ pub struct Alias {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub onboarding_complete: bool,
     pub wake_words: Vec<String>,
     pub activation: Activation,
     pub hotkey: String,
@@ -65,17 +66,14 @@ pub fn data_dir() -> PathBuf {
 
 impl Default for Settings {
     fn default() -> Self {
-        let root = data_dir();
         Self {
+            onboarding_complete: false,
             wake_words: vec!["вась".into(), "вася".into()],
             activation: Activation::Both,
             hotkey: "Ctrl+Alt+Space".into(),
             microphone: String::new(),
-            vosk_library: root.join("vosk/libvosk.dll").to_string_lossy().into(),
-            vosk_model: root
-                .join("models/vosk-model-small-ru-0.22")
-                .to_string_lossy()
-                .into(),
+            vosk_library: String::new(),
+            vosk_model: String::new(),
             speech_mode: SpeechMode::Vosk,
             whisper_executable: String::new(),
             whisper_model: String::new(),
@@ -177,6 +175,26 @@ pub fn save(settings: &Settings, path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn packaged_paths_follow_installation_and_preserve_custom_paths() {
+        let mut settings = Settings::default();
+        let resolved = resolve_speech(&settings, Path::new("installation"));
+        assert_eq!(
+            Path::new(&resolved.vosk_library),
+            Path::new("installation/speech/vosk/libvosk.dll")
+        );
+        assert!(settings.vosk_library.is_empty());
+        settings.vosk_model = "my-model".into();
+        assert_eq!(
+            resolve_speech(&settings, Path::new("updated-installation")).vosk_model,
+            "my-model"
+        );
+        settings.vosk_library = data_dir().join("vosk/libvosk.dll").to_string_lossy().into();
+        assert_eq!(
+            resolve_speech(&settings, Path::new("new")).vosk_library,
+            Path::new("new/speech/vosk/libvosk.dll").to_string_lossy()
+        );
+    }
+    #[test]
     fn settings_roundtrip_and_validation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -196,4 +214,30 @@ mod tests {
         std::fs::write(&path, br#"{"voice_feedback":"yes"}"#).unwrap();
         assert!(load(&path).is_err());
     }
+}
+
+/// Empty paths select installer resources; explicit custom paths survive upgrades.
+pub fn resolve_speech(settings: &Settings, resources: &Path) -> Settings {
+    let mut resolved = settings.clone();
+    let legacy = data_dir();
+    if settings.vosk_library.is_empty()
+        || settings.vosk_library == legacy.join("vosk/libvosk.dll").to_string_lossy()
+    {
+        resolved.vosk_library = resources
+            .join("speech/vosk/libvosk.dll")
+            .to_string_lossy()
+            .into();
+    }
+    if settings.vosk_model.is_empty()
+        || settings.vosk_model
+            == legacy
+                .join("models/vosk-model-small-ru-0.22")
+                .to_string_lossy()
+    {
+        resolved.vosk_model = resources
+            .join("speech/models/vosk-model-small-ru-0.22")
+            .to_string_lossy()
+            .into();
+    }
+    resolved
 }

@@ -10,18 +10,46 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{
-      "label": "main", "title": "Вася", "width": 1080, "height": 800,
-      "minWidth": 760, "minHeight": 600
-    }],
+    "windows": [
+      {
+        "label": "main",
+        "title": "Вася",
+        "width": 1080,
+        "height": 800,
+        "minWidth": 760,
+        "minHeight": 600
+      }
+    ],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.ico"],
-    "windows": {"nsis": {"installMode": "currentUser"}}
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "Russian",
+          "English"
+        ],
+        "displayLanguageSelector": true
+      },
+      "webviewInstallMode": {
+        "type": "offlineInstaller",
+        "silent": true
+      }
+    },
+    "resources": {
+      "resources/speech/": "speech/",
+      "../THIRD_PARTY.md": "THIRD_PARTY.md",
+      "../licenses/": "licenses/"
+    }
   }
 }
