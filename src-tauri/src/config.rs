@@ -1,0 +1,199 @@
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Activation {
+    Wake,
+    Hotkey,
+    Both,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechMode {
+    Vosk,
+    Whisper,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    LmStudio,
+    Ollama,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Alias {
+    pub phrase: String,
+    pub action: String,
+    #[serde(default)]
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub wake_words: Vec<String>,
+    pub activation: Activation,
+    pub hotkey: String,
+    pub microphone: String,
+    pub vosk_library: String,
+    pub vosk_model: String,
+    pub speech_mode: SpeechMode,
+    pub whisper_executable: String,
+    pub whisper_model: String,
+    pub music_service: String,
+    pub browser: String,
+    pub voice_feedback: bool,
+    pub start_muted: bool,
+    pub start_in_tray: bool,
+    pub command_timeout: u64,
+    pub llm_provider: LlmProvider,
+    pub llm_url: String,
+    pub llm_model: String,
+    pub aliases: Vec<Alias>,
+}
+
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("vasya-local"))
+        .join("Vasya")
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        let root = data_dir();
+        Self {
+            wake_words: vec!["вась".into(), "вася".into()],
+            activation: Activation::Both,
+            hotkey: "Ctrl+Alt+Space".into(),
+            microphone: String::new(),
+            vosk_library: root.join("vosk/libvosk.dll").to_string_lossy().into(),
+            vosk_model: root
+                .join("models/vosk-model-small-ru-0.22")
+                .to_string_lossy()
+                .into(),
+            speech_mode: SpeechMode::Vosk,
+            whisper_executable: String::new(),
+            whisper_model: String::new(),
+            music_service: "yandex".into(),
+            browser: "edge".into(),
+            voice_feedback: true,
+            start_muted: false,
+            start_in_tray: false,
+            command_timeout: 10,
+            llm_provider: LlmProvider::LmStudio,
+            llm_url: "http://198.18.0.1:1234".into(),
+            llm_model: "google/gemma-3-4b".into(),
+            aliases: Vec::new(),
+        }
+    }
+}
+
+impl Settings {
+    pub fn validate(&self) -> Result<()> {
+        if self.wake_words.is_empty() || self.wake_words.iter().any(|w| w.trim().is_empty()) {
+            bail!("Укажите хотя бы одно слово активации");
+        }
+        if !["yandex", "spotify", "youtube"].contains(&self.music_service.as_str()) {
+            bail!("Неизвестный музыкальный сервис");
+        }
+        if !["edge", "chrome"].contains(&self.browser.as_str()) {
+            bail!("Неизвестный браузер");
+        }
+        if !(3..=60).contains(&self.command_timeout) {
+            bail!("Ожидание команды: от 3 до 60 секунд");
+        }
+        if self.hotkey.trim().is_empty() {
+            bail!("Укажите горячую клавишу");
+        }
+        let url = url::Url::parse(&self.llm_url).context("Некорректный адрес сервера генерации")?;
+        if !["http", "https"].contains(&url.scheme())
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            bail!("Адрес сервера: http(s)://хост:порт без пути и пароля; /v1 добавляется автоматически");
+        }
+        if self.llm_model.trim().is_empty() {
+            bail!("Укажите модель генерации текста");
+        }
+        for alias in &self.aliases {
+            if alias.phrase.trim().is_empty()
+                || ![
+                    "search", "music", "youtube", "generate", "insert", "pause", "resume", "next",
+                    "mute",
+                ]
+                .contains(&alias.action.as_str())
+            {
+                bail!("Некорректный пользовательский псевдоним команды");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn load(path: &Path) -> Result<Settings> {
+    if !path.exists() {
+        return Ok(Settings::default());
+    }
+    let settings: Settings = serde_json::from_slice(&std::fs::read(path)?)
+        .context("Не удалось прочитать settings.json. Исправьте или переименуйте файл.")?;
+    settings.validate()?;
+    Ok(settings)
+}
+
+pub fn save(settings: &Settings, path: &Path) -> Result<()> {
+    settings.validate()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(settings)?)?;
+    // Windows rename cannot replace an existing destination; keep a recoverable backup.
+    let backup = path.with_extension("bak");
+    if path.exists() {
+        std::fs::copy(path, &backup)?;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        if backup.exists() && !path.exists() {
+            let _ = std::fs::copy(&backup, path);
+        }
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn settings_roundtrip_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        save(&settings, &path).unwrap();
+        settings.wake_words = vec!["помощник".into(), "вася".into()];
+        save(&settings, &path).unwrap();
+        assert_eq!(load(&path).unwrap().wake_words, settings.wake_words);
+        settings.llm_url = "file:///secret".into();
+        assert!(save(&settings, &path).is_err());
+        assert!(load(&path).is_ok());
+    }
+    #[test]
+    fn malformed_config_is_not_silently_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, br#"{"voice_feedback":"yes"}"#).unwrap();
+        assert!(load(&path).is_err());
+    }
+}

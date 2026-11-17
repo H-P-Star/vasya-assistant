@@ -1,0 +1,304 @@
+use crate::{
+    activation::{strip_wake, Accepted, Gate},
+    config::{Activation, Settings, SpeechMode},
+    runtime::{Shared, Task},
+    speech::Vosk,
+};
+use anyhow::{bail, Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::{
+    path::Path,
+    sync::{
+        atomic::Ordering::SeqCst,
+        mpsc::{self, Receiver, SyncSender},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+pub fn devices() -> Result<Vec<String>> {
+    Ok(cpal::default_host()
+        .input_devices()?
+        .filter_map(|d| d.name().ok())
+        .collect())
+}
+
+/// Stateful linear resampling, including phase across arbitrary callback boundaries.
+struct Resampler {
+    ratio: f64,
+    position: f64,
+    previous: f32,
+    initialized: bool,
+}
+impl Resampler {
+    fn new(rate: u32) -> Self {
+        Self {
+            ratio: rate as f64 / 16000.0,
+            position: 0.0,
+            previous: 0.0,
+            initialized: false,
+        }
+    }
+    fn push(&mut self, input: &[f32]) -> Vec<i16> {
+        let mut output = Vec::new();
+        for &sample in input {
+            if !self.initialized {
+                self.previous = sample;
+                self.initialized = true;
+            }
+            while self.position < 1.0 {
+                let value = self.previous + (sample - self.previous) * self.position as f32;
+                output.push((value.clamp(-1.0, 1.0) * 32767.0) as i16);
+                self.position += self.ratio;
+            }
+            self.position -= 1.0;
+            self.previous = sample;
+        }
+        output
+    }
+}
+
+fn stream(settings: &Settings, state: Arc<Shared>) -> Result<(cpal::Stream, Receiver<Vec<i16>>)> {
+    let host = cpal::default_host();
+    let device = if settings.microphone.is_empty() {
+        host.default_input_device()
+    } else {
+        host.input_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(&settings.microphone))
+    }
+    .context("Микрофон не найден. Проверьте выбор и разрешения Windows.")?;
+    let supported = device.default_input_config()?;
+    let channels = supported.channels() as usize;
+    let rate = supported.sample_rate().0;
+    let config: cpal::StreamConfig = supported.clone().into();
+    let (tx, rx) = mpsc::sync_channel(48);
+    fn build<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        channels: usize,
+        rate: u32,
+        tx: SyncSender<Vec<i16>>,
+        state: Arc<Shared>,
+    ) -> Result<cpal::Stream>
+    where
+        T: cpal::SizedSample + cpal::Sample,
+        f32: cpal::FromSample<T>,
+    {
+        let mut resampler = Resampler::new(rate);
+        let mut level_time = Instant::now();
+        let errors = state.clone();
+        Ok(device.build_input_stream(
+            config,
+            move |data: &[T], _| {
+                if state.muted.load(SeqCst) || state.busy.load(SeqCst) || state.stop.load(SeqCst) {
+                    return;
+                }
+                let mono: Vec<f32> = data
+                    .chunks_exact(channels)
+                    .map(|frame| {
+                        frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
+                    })
+                    .collect();
+                if level_time.elapsed() > Duration::from_millis(100) {
+                    let rms =
+                        (mono.iter().map(|s| s * s).sum::<f32>() / mono.len().max(1) as f32).sqrt();
+                    state.level((rms * 5.0).min(1.0));
+                    level_time = Instant::now();
+                }
+                let samples = resampler.push(&mono);
+                if tx.try_send(samples).is_err() {
+                    // A gap invalidates the current utterance instead of executing a truncated command.
+                    state.epoch.fetch_add(1, SeqCst);
+                }
+            },
+            move |error| {
+                errors.emit(
+                    "error",
+                    format!("Ошибка микрофона: {error}. Сохраните настройки для перезапуска."),
+                );
+                errors.epoch.fetch_add(1, SeqCst);
+            },
+            Some(Duration::from_secs(3)),
+        )?)
+    }
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => build::<f32>(&device, &config, channels, rate, tx, state)?,
+        cpal::SampleFormat::I16 => build::<i16>(&device, &config, channels, rate, tx, state)?,
+        cpal::SampleFormat::U16 => build::<u16>(&device, &config, channels, rate, tx, state)?,
+        other => bail!("Неподдерживаемый формат микрофона: {other}"),
+    };
+    stream.play()?;
+    Ok((stream, rx))
+}
+
+pub fn run(state: Arc<Shared>, sender: SyncSender<Task>) {
+    while !state.stop.load(SeqCst) {
+        let version = state.config_version.load(SeqCst);
+        if let Err(error) = session(&state, &sender, version) {
+            state.capture_open.store(false, SeqCst);
+            state.emit("status", "Требуется настройка микрофона или модели");
+            state.emit("error", format!("{error:#}"));
+            while !state.stop.load(SeqCst) && state.config_version.load(SeqCst) == version {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    state.capture_open.store(false, SeqCst);
+}
+
+fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Result<()> {
+    let settings = state.snapshot();
+    state.emit("status", "Загружаю локальную модель");
+    let mut vosk = Vosk::load(
+        Path::new(&settings.vosk_library),
+        Path::new(&settings.vosk_model),
+        16000.0,
+    )?;
+    let mut gate = Gate::new(
+        settings.activation.clone(),
+        settings.wake_words.clone(),
+        settings.command_timeout,
+    );
+    let mut input = None;
+    let mut utterance = Vec::new();
+    let mut epoch = state.epoch.load(SeqCst);
+    let mut status = String::new();
+    while !state.stop.load(SeqCst) && state.config_version.load(SeqCst) == version {
+        let now = Instant::now();
+        if epoch != state.epoch.load(SeqCst) {
+            epoch = state.epoch.load(SeqCst);
+            gate.reset();
+            vosk.reset();
+            utterance.clear();
+            input = None;
+            state.capture_open.store(false, SeqCst);
+        }
+        if state.activate.swap(false, SeqCst) {
+            // Do not reinterpret audio buffered before the key press as a new command.
+            input = None;
+            state.capture_open.store(false, SeqCst);
+            gate.arm(now);
+            vosk.reset();
+            utterance.clear();
+        }
+        let muted = state.muted.load(SeqCst);
+        let busy = state.busy.load(SeqCst);
+        let dictating = state.dictating.load(SeqCst);
+        let should_capture = !muted
+            && !busy
+            && (settings.activation != Activation::Hotkey || gate.armed(now) || dictating);
+        let label = if muted {
+            "Микрофон отключён"
+        } else if busy {
+            "Выполняю команду"
+        } else if dictating {
+            "Диктовка · скажите «стоп диктовка» для завершения"
+        } else if gate.armed(now) {
+            "Слушаю команду…"
+        } else if settings.activation == Activation::Hotkey {
+            "Ожидаю горячую клавишу"
+        } else {
+            "Ожидаю слово активации"
+        };
+        if label != status {
+            status = label.into();
+            state.emit("status", label);
+        }
+        if !should_capture {
+            input = None;
+            state.capture_open.store(false, SeqCst);
+            vosk.reset();
+            utterance.clear();
+            if muted || busy {
+                gate.reset();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        if input.is_none() {
+            input = Some(stream(&settings, state.clone())?);
+            state.capture_open.store(true, SeqCst);
+        }
+        let (_, receiver) = input.as_ref().unwrap();
+        let samples = match receiver.recv_timeout(Duration::from_millis(40)) {
+            Ok(samples) => samples,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => bail!("Поток микрофона остановлен"),
+        };
+        if state.muted.load(SeqCst) || state.busy.load(SeqCst) || state.epoch.load(SeqCst) != epoch
+        {
+            continue;
+        }
+        utterance.extend_from_slice(&samples);
+        if utterance.len() > 16000 * 30 {
+            utterance.clear();
+            vosk.reset();
+            gate.reset();
+            state.emit(
+                "info",
+                "Фраза длиннее 30 секунд. Сделайте паузу и повторите команду.",
+            );
+            continue;
+        }
+        if let Some(text) = vosk.accept(&samples)? {
+            let had_wake = !dictating && strip_wake(&text, &settings.wake_words).is_some();
+            match gate.accept(&text, dictating, Instant::now()) {
+                Accepted::Wake => {
+                    state.target.store(state.platform.foreground(), SeqCst);
+                    state.emit("status", "Слушаю команду…");
+                }
+                Accepted::Command(body) => {
+                    if had_wake {
+                        state.target.store(state.platform.foreground(), SeqCst);
+                    }
+                    let target = state.target.load(SeqCst);
+                    if state
+                        .busy
+                        .compare_exchange(false, true, SeqCst, SeqCst)
+                        .is_ok()
+                    {
+                        let samples = (settings.speech_mode == SpeechMode::Whisper)
+                            .then(|| utterance.clone());
+                        if sender
+                            .try_send(Task::Text {
+                                text: body,
+                                target,
+                                epoch,
+                                preview: false,
+                                samples,
+                                had_wake,
+                                dictating,
+                            })
+                            .is_err()
+                        {
+                            state.busy.store(false, SeqCst);
+                        }
+                    }
+                }
+                Accepted::Ignore => {}
+            }
+            utterance.clear();
+        }
+    }
+    drop(input);
+    state.capture_open.store(false, SeqCst);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn resampling_preserves_chunk_boundaries() {
+        let input: Vec<_> = (0..4800).map(|i| (i as f32 * 0.03).sin()).collect();
+        let mut whole = Resampler::new(48000);
+        let expected = whole.push(&input);
+        let mut chunks = Resampler::new(48000);
+        let actual: Vec<_> = input
+            .chunks(137)
+            .flat_map(|chunk| chunks.push(chunk))
+            .collect();
+        assert_eq!(expected, actual);
+        assert_eq!(expected.len(), 1600);
+    }
+}
