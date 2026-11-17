@@ -32,7 +32,7 @@ use windows::{
 pub struct Windows;
 
 pub fn open_url(url: &str) -> Result<()> {
-    // SAFETY: strings remain alive for the call; only validated HTTP(S) URLs reach this function.
+    // SAFETY: strings remain alive for the call; callers validate web URLs or music protocols.
     let result = unsafe {
         ShellExecuteW(
             None,
@@ -47,6 +47,14 @@ pub fn open_url(url: &str) -> Result<()> {
         bail!("Windows не удалось открыть браузер по умолчанию");
     }
     Ok(())
+}
+
+pub fn open_music_uri(uri: &str) -> Result<()> {
+    let parsed = url::Url::parse(uri)?;
+    if !["yandexmusic", "spotify"].contains(&parsed.scheme()) {
+        bail!("Неизвестный протокол музыкального приложения");
+    }
+    open_url(uri).map_err(|_| anyhow::anyhow!("Музыкальное приложение не установлено или его протокол не зарегистрирован. Укажите путь к .exe в настройках."))
 }
 
 fn insert_text(text: &str, target: isize) -> Result<()> {
@@ -105,6 +113,20 @@ impl Drop for Com {
 }
 
 impl crate::runtime::Platform for Windows {
+    fn launch_app(&self, path: &str) -> Result<()> {
+        let path = std::path::Path::new(path.trim().trim_matches('"'));
+        if !path.is_absolute()
+            || !path.is_file()
+            || !path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        {
+            bail!("Укажите полный путь к существующему .exe в редакторе команды");
+        }
+        std::process::Command::new(path).spawn()?;
+        Ok(())
+    }
     fn foreground(&self) -> isize {
         unsafe { GetForegroundWindow().0 as isize }
     }

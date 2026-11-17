@@ -238,6 +238,11 @@ fn save_settings(
         return Err(error.to_string());
     }
     runtime.update(settings);
+    if !runtime.shared.snapshot().island_enabled {
+        if let Some(window) = app.get_webview_window("island") {
+            let _ = window.hide();
+        }
+    }
     Ok(())
 }
 
@@ -287,6 +292,7 @@ pub fn run() {
                 .build(),
         )
         .manage(StartupErrors::default())
+        .manage(crate::island::Island::default())
         .setup(|app| {
             let path = config::data_dir().join("settings.json");
             let settings = match config::load(&path) {
@@ -310,6 +316,7 @@ pub fn run() {
                         let _ = tray.set_tooltip(Some(format!("Вася · {}", event.text)));
                     }
                 }
+                crate::island::update(&handle, &event);
                 let _ = handle.emit("assistant", event);
             });
             let runtime = Runtime::start_with_resources(

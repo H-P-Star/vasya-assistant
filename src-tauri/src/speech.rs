@@ -13,6 +13,39 @@ type Accept = unsafe extern "C" fn(*mut c_void, *const i16, c_int) -> c_int;
 type Text = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type Reset = unsafe extern "C" fn(*mut c_void);
 
+fn model_path_cstring(model: &Path) -> Result<CString> {
+    // Tauri canonicalizes the executable path; Windows then adds a \\?\ prefix.
+    // Rust can read that path, but Vosk's narrow stat/ifstream cannot reliably do so.
+    let ordinary = dunce::canonicalize(model)
+        .with_context(|| format!("Не удалось получить путь модели «{}»", model.display()))?;
+    Ok(CString::new(ordinary.to_str().context(
+        "Путь модели содержит неподдерживаемые символы",
+    )?)?)
+}
+
+fn validate_model(model: &Path) -> Result<()> {
+    use std::io::Read;
+    let files = if model.join("am/final.mdl").is_file() {
+        vec!["am/final.mdl", "conf/model.conf"]
+    } else if model.join("final.mdl").is_file() {
+        vec!["final.mdl", "mfcc.conf"]
+    } else {
+        bail!("В папке модели «{}» не найден am/final.mdl. Выберите папку vosk-model-small-ru-0.22, внутри которой находятся am, conf и graph.", model.display());
+    };
+    for relative in files {
+        let path = model.join(relative);
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("Не удаётся прочитать файл модели «{}»", path.display()))?;
+        if file.read(&mut [0u8; 1])? == 0 {
+            bail!(
+                "Файл модели пуст: {}. Переустановите полный комплект.",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub struct Vosk {
     // Kept alive until both opaque handles have been freed in Drop.
     _library: Library,
@@ -22,6 +55,7 @@ pub struct Vosk {
     free_recognizer: Free,
     accept: Accept,
     result: Text,
+    partial_result: Text,
     reset: Reset,
 }
 
@@ -35,7 +69,8 @@ impl Vosk {
         if !model.is_dir() {
             bail!("Не найдена папка модели Vosk. Укажите распакованную модель в настройках.");
         }
-        let model_path = CString::new(model.to_string_lossy().as_bytes())?;
+        validate_model(model)?;
+        let model_path = model_path_cstring(model)?;
         // SAFETY: User explicitly configures a trusted native Vosk library. All symbol signatures
         // match vosk_api.h; the library outlives its handles, which stay on their creating thread.
         unsafe {
@@ -52,11 +87,12 @@ impl Vosk {
             let free_recognizer: Free = *lib.get(b"vosk_recognizer_free\0")?;
             let accept: Accept = *lib.get(b"vosk_recognizer_accept_waveform_s\0")?;
             let result: Text = *lib.get(b"vosk_recognizer_result\0")?;
+            let partial_result: Text = *lib.get(b"vosk_recognizer_partial_result\0")?;
             let reset: Reset = *lib.get(b"vosk_recognizer_reset\0")?;
             let set_log: unsafe extern "C" fn(c_int) = *lib.get(b"vosk_set_log_level\0")?;
             set_log(-1);
-            let model = NonNull::new(new_model(model_path.as_ptr()))
-                .context("Vosk не смогла открыть модель")?;
+            let handle = NonNull::new(new_model(model_path.as_ptr()));
+            let model = handle.with_context(|| format!("Vosk не смогла открыть модель «{}». Основные файлы доступны, но библиотека не смогла их загрузить. Проверьте полный комплект модели и её совместимость с Vosk. Микрофон здесь ещё не используется.", model.display()))?;
             let Some(recognizer) = NonNull::new(new_recognizer(model.as_ptr(), sample_rate)) else {
                 free_model(model.as_ptr());
                 bail!("Vosk не смогла создать распознаватель");
@@ -69,6 +105,7 @@ impl Vosk {
                 free_recognizer,
                 accept,
                 result,
+                partial_result,
                 reset,
             })
         }
@@ -100,6 +137,17 @@ impl Vosk {
 
     pub fn reset(&mut self) {
         unsafe { (self.reset)(self.recognizer.as_ptr()) };
+    }
+
+    pub fn partial(&mut self) -> Result<String> {
+        // SAFETY: Vosk owns the NUL-terminated result until the next recognizer call.
+        let ptr = unsafe { (self.partial_result)(self.recognizer.as_ptr()) };
+        if ptr.is_null() {
+            bail!("Vosk вернула пустой частичный результат");
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(unsafe { CStr::from_ptr(ptr) }.to_bytes())?;
+        Ok(json["partial"].as_str().unwrap_or_default().into())
     }
 }
 
@@ -192,6 +240,43 @@ pub fn whisper(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrong_model_root_reports_actual_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = validate_model(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("am/final.mdl"));
+        assert!(error.contains(&dir.path().display().to_string()));
+    }
+
+    #[test]
+    fn missing_or_empty_config_is_reported_before_native_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("am")).unwrap();
+        std::fs::write(dir.path().join("am/final.mdl"), [1]).unwrap();
+        assert!(validate_model(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("conf/model.conf"));
+        std::fs::create_dir_all(dir.path().join("conf")).unwrap();
+        std::fs::write(dir.path().join("conf/model.conf"), []).unwrap();
+        assert!(validate_model(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("пуст"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tauri_style_verbatim_model_path_is_converted_for_vosk() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+        let encoded = model_path_cstring(&verbatim).unwrap();
+        let text = encoded.to_str().unwrap();
+        assert!(!text.starts_with(r"\\?\"));
+        assert!(Path::new(text).is_dir());
+    }
+
     #[test]
     fn wav_has_valid_pcm_header() {
         let dir = tempfile::tempdir().unwrap();

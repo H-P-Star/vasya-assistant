@@ -20,8 +20,23 @@ pub fn generate_with_cancel(
     prompt: &str,
     cancelled: impl Fn() -> bool,
 ) -> Result<String> {
-    let system = "Отвечай по-русски, если не просят иначе. Напиши только запрошенный текст.";
-    let (path, body) = match settings.llm_provider {
+    request(
+        settings,
+        prompt,
+        "Отвечай по-русски, если не просят иначе. Напиши только запрошенный текст.",
+        false,
+        cancelled,
+    )
+}
+
+fn request(
+    settings: &Settings,
+    prompt: &str,
+    system: &str,
+    json_mode: bool,
+    cancelled: impl Fn() -> bool,
+) -> Result<String> {
+    let (path, mut body) = match settings.llm_provider {
         LlmProvider::LmStudio => (
             "/v1/chat/completions",
             json!({
@@ -37,6 +52,24 @@ pub fn generate_with_cancel(
             }),
         ),
     };
+    if json_mode {
+        match settings.llm_provider {
+            LlmProvider::LmStudio => {
+                body["response_format"] = json!({"type":"json_schema", "json_schema": {
+                    "name":"vasya_intent", "strict":true, "schema": {
+                        "type":"object", "additionalProperties":false, "required":["action"],
+                        "properties": {
+                            "action":{"type":"string","enum":["music","search","youtube","pause","resume","next","volume_up","volume_down","volume","dictation_start","dictation_stop","mute","insert","answer"]},
+                            "query":{"type":"string"}, "text":{"type":"string"},
+                            "category":{"type":"string","enum":["track","artist","playlist"]},
+                            "value":{"type":"integer","minimum":0,"maximum":100}
+                        }
+                    }
+                }})
+            }
+            LlmProvider::Ollama => body["format"] = json!("json"),
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -86,6 +119,79 @@ pub fn generate_with_cancel(
     Ok(text.into())
 }
 
+pub fn resolve(
+    settings: &Settings,
+    utterance: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<crate::commands::Command> {
+    let system = r#"Ты голосовой помощник Вася. Определи намерение пользователя и верни ТОЛЬКО JSON.
+Разрешены следующие формы:
+{"action":"music","query":"название","category":"track"} category: track/artist/playlist.
+{"action":"search","query":"запрос"}, {"action":"youtube","query":"запрос"}.
+{"action":"pause"}, {"action":"resume"}, {"action":"next"},
+{"action":"volume_up"}, {"action":"volume_down"}, {"action":"volume","value":35},
+{"action":"dictation_start"}, {"action":"dictation_stop"}, {"action":"mute"}.
+Если пользователь явно просит написать/вставить текст: {"action":"insert","text":"готовый текст"}.
+Если вопрос, разговор или подходящего действия нет: {"action":"answer","text":"содержательный ответ по-русски"}.
+Не выдумывай действий, путей программ, shell-команд. Не запускай музыку при просьбе просто объяснить что-то.
+При неясном запросе ответь уточняющим вопросом через answer. value только целое от 0 до 100."#;
+    let text = request(settings, utterance, system, true, cancelled)?;
+    parse_resolution(&text)
+}
+
+fn parse_resolution(text: &str) -> Result<crate::commands::Command> {
+    use crate::commands::{Category, Command};
+    let text = text.trim();
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|text| text.strip_suffix("```"))
+        .unwrap_or(text)
+        .trim();
+    let plan: Value = serde_json::from_str(text)
+        .context("LLM вернула некорректный план. Действие не выполнено")?;
+    let field = |name: &str| -> Result<String> {
+        let value = plan[name]
+            .as_str()
+            .context("LLM не указала текст действия")?
+            .trim();
+        if value.is_empty() || value.chars().count() > 16000 {
+            bail!("LLM вернула пустой или слишком длинный текст");
+        }
+        Ok(value.into())
+    };
+    Ok(match plan["action"].as_str() {
+        Some("music") => Command::Music {
+            query: field("query")?,
+            category: match plan["category"].as_str().unwrap_or("track") {
+                "track" => Category::Track,
+                "artist" => Category::Artist,
+                "playlist" => Category::Playlist,
+                _ => bail!("LLM вернула неизвестную категорию музыки"),
+            },
+        },
+        Some("search") => Command::Search(field("query")?),
+        Some("youtube") => Command::Youtube(field("query")?),
+        Some("pause") => Command::Pause,
+        Some("resume") => Command::Resume,
+        Some("next") => Command::Next,
+        Some("volume_up") => Command::VolumeUp,
+        Some("volume_down") => Command::VolumeDown,
+        Some("volume") => Command::Volume(
+            plan["value"]
+                .as_u64()
+                .filter(|v| *v <= 100)
+                .context("LLM указала недопустимую громкость")? as u8,
+        ),
+        Some("dictation_start") => Command::DictationStart,
+        Some("dictation_stop") => Command::DictationStop,
+        Some("mute") => Command::Mute,
+        Some("insert") => Command::Insert(field("text")?),
+        Some("answer") => Command::Answer(field("text")?),
+        _ => bail!("LLM предложила неподдерживаемое действие. Оно не выполнено"),
+    })
+}
+
 pub fn models(settings: &Settings) -> Result<Vec<String>> {
     let path = match settings.llm_provider {
         LlmProvider::LmStudio => "/v1/models",
@@ -112,6 +218,38 @@ pub fn models(settings: &Settings) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn intent_plans_select_only_supported_actions_or_answers() {
+        use crate::commands::{Category, Command};
+        assert_eq!(
+            parse_resolution(r#"{"action":"music","query":"Кино","category":"artist"}"#).unwrap(),
+            Command::Music {
+                query: "Кино".into(),
+                category: Category::Artist
+            }
+        );
+        assert_eq!(
+            parse_resolution(r#"{"action":"pause"}"#).unwrap(),
+            Command::Pause
+        );
+        assert_eq!(
+            parse_resolution("```json\n{\"action\":\"answer\",\"text\":\"IPv6 — протокол\"}\n```")
+                .unwrap(),
+            Command::Answer("IPv6 — протокол".into())
+        );
+        for plan in [
+            r#"{"action":"shell","command":"calc.exe"}"#,
+            r#"{"action":"launch_app","text":"calc.exe"}"#,
+            r#"{"action":"volume","value":101}"#,
+            r#"{"action":"volume","value":-1}"#,
+            r#"{"action":"volume","value":0.5}"#,
+            r#"{"action":"answer","text":" "}"#,
+            r#"{"action":"music","query":"Кино","category":"unknown"}"#,
+            "not JSON",
+        ] {
+            assert!(parse_resolution(plan).is_err(), "{plan}");
+        }
+    }
     use std::{
         io::{Read, Write},
         net::TcpListener,
@@ -122,6 +260,16 @@ mod tests {
         response: &str,
         path: &str,
         inspect: fn(Value),
+    ) -> Result<String> {
+        exercise_request(provider, response, path, inspect, false)
+    }
+
+    fn exercise_request(
+        provider: LlmProvider,
+        response: &str,
+        path: &str,
+        inspect: fn(Value),
+        json_mode: bool,
     ) -> Result<String> {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = server.local_addr().unwrap();
@@ -167,9 +315,40 @@ mod tests {
             llm_provider: provider,
             ..Settings::default()
         };
-        let result = generate(&settings, "что такое IPv6");
+        let result = request(&settings, "что такое IPv6", "system", json_mode, || false);
         thread.join().unwrap();
         result
+    }
+    #[test]
+    fn intent_requests_use_supported_structured_formats() {
+        let text = exercise_request(
+            LlmProvider::LmStudio,
+            r#"{"choices":[{"message":{"content":"{\"action\":\"pause\"}"}}]}"#,
+            "/v1/chat/completions",
+            |body| {
+                assert_eq!(body["response_format"]["type"], "json_schema");
+                let schema = &body["response_format"]["json_schema"]["schema"];
+                assert_eq!(schema["additionalProperties"], false);
+                assert!(!schema["properties"]["action"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("launch_app")));
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_resolution(&text).unwrap(),
+            crate::commands::Command::Pause
+        );
+        exercise_request(
+            LlmProvider::Ollama,
+            r#"{"response":"{\"action\":\"pause\"}"}"#,
+            "/api/generate",
+            |body| assert_eq!(body["format"], "json"),
+            true,
+        )
+        .unwrap();
     }
     #[test]
     fn lm_studio_uses_chat_completions() {

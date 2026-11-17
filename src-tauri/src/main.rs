@@ -7,7 +7,9 @@ fn main() {
             std::process::exit(2);
         };
         let result = (|| -> anyhow::Result<()> {
-            let exe = std::env::current_exe()?;
+            // Match the canonical path supplied by Tauri in the GUI, including
+            // Windows verbatim prefixes. The installed self-test must cover it.
+            let exe = std::env::current_exe()?.canonicalize()?;
             let settings = vasya::config::resolve_speech(
                 &vasya::config::Settings::default(),
                 exe.parent().unwrap(),

@@ -2,7 +2,7 @@ use crate::{commands::Category, config::Settings};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -102,14 +102,17 @@ pub trait MusicService {
 pub struct BrowserProcess {
     pub closing: bool,
     pub child: Option<Child>,
+    pub keep_alive: bool,
 }
 
 impl BrowserProcess {
     pub fn close(&mut self) {
         self.closing = true;
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if !self.keep_alive {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -121,6 +124,8 @@ pub struct BrowserMusic {
     chrome: Option<Chrome>,
     browser: String,
     process: ProcessRegistry,
+    native_key: String,
+    native_chrome: Option<Chrome>,
 }
 
 impl BrowserMusic {
@@ -147,6 +152,11 @@ impl BrowserMusic {
     }
 
     pub fn login(&mut self, settings: &Settings) -> Result<String> {
+        if settings.music_mode == "desktop" && settings.music_service != "youtube" {
+            self.play_native(settings, "", &Category::Track)?;
+            return Ok("Музыкальное приложение открыто. Войдите в аккаунт, если требуется.".into());
+        }
+        self.native_chrome = None;
         let url = match settings.music_service.as_str() {
             "spotify" => "https://open.spotify.com",
             "youtube" => "https://music.youtube.com",
@@ -172,6 +182,10 @@ impl MusicService for BrowserMusic {
                 }
             ));
         }
+        if settings.music_mode == "desktop" {
+            return self.play_native(settings, query, category);
+        }
+        self.native_chrome = None;
         let mut url = if settings.music_service == "spotify" {
             let mut url = url::Url::parse("https://open.spotify.com/search/")?;
             url.path_segments_mut().unwrap().pop_if_empty().push(query);
@@ -190,6 +204,14 @@ impl MusicService for BrowserMusic {
         };
         url.set_fragment(None);
         let chrome = self.chrome(settings)?;
+        if query.is_empty() {
+            chrome.navigate(if settings.music_service == "spotify" {
+                "https://open.spotify.com"
+            } else {
+                "https://music.yandex.ru"
+            })?;
+            return Ok("Музыкальный сервис открыт".into());
+        }
         chrome.navigate(url.as_str())?;
         let category = match category {
             Category::Track => "track",
@@ -208,21 +230,208 @@ impl MusicService for BrowserMusic {
     }
 }
 
+pub fn native_music_uri(service: &str, query: &str, category: &Category) -> String {
+    if service == "spotify" {
+        if query.is_empty() {
+            return "spotify:".into();
+        }
+        let encoded: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+        return format!("spotify:search:{}", encoded.replace('+', "%20"));
+    }
+    if query.is_empty() {
+        return "yandexmusic://".into();
+    }
+    let mut params = url::form_urlencoded::Serializer::new(String::new());
+    params.append_pair("text", query).append_pair(
+        "type",
+        match category {
+            Category::Track => "track",
+            Category::Artist => "artist",
+            Category::Playlist => "playlist",
+        },
+    );
+    format!("yandexmusic://search?{}", params.finish())
+}
+
+fn native_executable(settings: &Settings) -> Result<Option<PathBuf>> {
+    let (custom, candidates) = if settings.music_service == "spotify" {
+        (
+            &settings.spotify_app_path,
+            vec![
+                ("APPDATA", "Spotify/Spotify.exe"),
+                ("LOCALAPPDATA", "Microsoft/WindowsApps/Spotify.exe"),
+            ],
+        )
+    } else {
+        (
+            &settings.yandex_app_path,
+            vec![
+                ("LOCALAPPDATA", "Programs/YandexMusic/Яндекс Музыка.exe"),
+                ("LOCALAPPDATA", "Programs/YandexMusic/Yandex Music.exe"),
+            ],
+        )
+    };
+    if !custom.trim().is_empty() {
+        let path = PathBuf::from(custom.trim().trim_matches('"'));
+        if !path.is_absolute()
+            || !path.is_file()
+            || !path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("exe"))
+        {
+            bail!(
+                "Не найден .exe музыкального приложения: {}. Проверьте путь в настройках.",
+                path.display()
+            );
+        }
+        return Ok(Some(path));
+    }
+    Ok(candidates.into_iter().find_map(|(key, suffix)| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .map(|p| p.join(suffix))
+            .filter(|p| p.is_file())
+    }))
+}
+
+fn open_native(settings: &Settings, uri: &str) -> Result<()> {
+    if let Some(exe) = native_executable(settings)? {
+        Command::new(exe)
+            .arg(uri)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    return crate::platform::open_music_uri(uri);
+    #[cfg(not(windows))]
+    bail!("Музыкальное приложение поддерживается в Windows");
+}
+
+impl BrowserMusic {
+    fn play_native(
+        &mut self,
+        settings: &Settings,
+        query: &str,
+        category: &Category,
+    ) -> Result<String> {
+        self.chrome = None;
+        let uri = native_music_uri(&settings.music_service, query, category);
+        let key = format!(
+            "{}|{}|{}",
+            settings.music_service, settings.yandex_app_path, settings.spotify_app_path
+        );
+        let stale = self
+            .native_chrome
+            .as_mut()
+            .is_some_and(|c| c.evaluate("1").is_err());
+        if key != self.native_key || stale {
+            self.native_chrome = None;
+        }
+        if settings.music_service == "spotify" {
+            open_native(settings, &uri)?;
+            return Ok(if query.is_empty() {
+                "Музыкальное приложение открыто".into()
+            } else {
+                format!("Открыт поиск Spotify в приложении: {query}. Выберите результат и нажмите «Играть».")
+            });
+        }
+        if let Some(chrome) = self.native_chrome.as_mut() {
+            let _ =
+                chrome.evaluate("window.__vasyaClicked = false; window.__vasyaNavigated = false; window.__vasyaFiltered = false");
+            open_native(settings, &uri)?;
+        } else {
+            // Electron accepts a loopback CDP port only at its first launch. An already
+            // running client receives the deep link but may require manual playback.
+            if let Some(exe) = native_executable(settings)? {
+                match Chrome::launch_native(&exe, &uri, self.process.clone()) {
+                    Ok(chrome) => self.native_chrome = Some(chrome),
+                    Err(_) => open_native(settings, &uri)?,
+                }
+                self.native_key = key;
+            } else {
+                open_native(settings, &uri)?;
+            }
+        }
+        if query.is_empty() {
+            return Ok("Музыкальное приложение открыто".into());
+        }
+        if let Some(chrome) = self.native_chrome.as_mut() {
+            // Deep links navigate asynchronously; do not click the previous search results.
+            let mut at_search = false;
+            let kind = match category {
+                Category::Track => "track",
+                Category::Artist => "artist",
+                Category::Playlist => "playlist",
+            };
+            let script = PLAY_SCRIPT.replace("__CATEGORY__", kind);
+            for _ in 0..12 {
+                if !at_search {
+                    at_search = chrome
+                        .evaluate("location.href")
+                        .ok()
+                        .and_then(|v| v.as_str().and_then(|s| url::Url::parse(s).ok()))
+                        .is_some_and(|url| {
+                            url.query_pairs().any(|(k, v)| k == "text" && v == query)
+                        });
+                    // Give the SPA a rendering turn after the deep link changes its URL.
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                if at_search {
+                    match chrome
+                        .evaluate(&script)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .as_deref()
+                    {
+                        Some("playing") => {
+                            return Ok(format!("Воспроизведение в приложении началось: {query}"))
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        Ok(format!("Открыт поиск Яндекс Музыки в приложении: {query}. Если музыка не началась, войдите в аккаунт и нажмите «Играть». Для автоматического запуска попробуйте закрыть клиент через его трей и повторить команду."))
+    }
+}
+
 // Only fixed adapter code is evaluated; no transcribed text is interpolated into JavaScript.
 const PLAY_SCRIPT: &str = r#"(() => {
-  if (window.__vasyaClicked && ([...document.querySelectorAll('audio,video')].some(m => !m.paused && m.currentTime > 0)
-      || navigator.mediaSession?.playbackState === 'playing')) return 'playing';
+  const media = [...document.querySelectorAll('audio,video')];
+  const playing = media.some(m => !m.paused && m.currentTime > 0) || navigator.mediaSession?.playbackState === 'playing';
+  const metadata = navigator.mediaSession?.metadata;
+  const signature = [metadata?.title, metadata?.artist, metadata?.album, ...media.map(m => m.currentSrc)].join('|');
+  const time = Math.max(0, ...media.map(m => m.currentTime));
+  if (window.__vasyaClicked && playing && (!window.__vasyaBefore?.playing
+      || signature !== window.__vasyaBefore.signature || time + 0.5 < window.__vasyaBefore.time)) return 'playing';
   if (window.__vasyaClicked) return 'waiting';
   const type = '__CATEGORY__';
+  if (!window.__vasyaFiltered) {
+    const label = {track: /^(треки|песни|tracks|songs)$/i, artist: /^(исполнители|артисты|artists)$/i, playlist: /^(плейлисты|playlists)$/i}[type];
+    const tab = [...document.querySelectorAll('[role="tab"], [class*="SearchPage_tab"]')]
+      .find(t => label.test((t.textContent || '').trim()));
+    window.__vasyaFiltered = true;
+    if (tab && tab.getAttribute('aria-selected') !== 'true' && !tab.className.includes('tab_selected')) {
+      tab.click(); return 'waiting';
+    }
+  }
   const roots = type === 'track'
-    ? '[class*="Track_root"], .d-track, [data-testid="tracklist-row"]'
+    ? '[class*="Track_root"], [class*="HorizontalCardContainer_root"]:has(a[href*="/track/"]), .d-track, [data-testid="tracklist-row"]'
     : type === 'artist' ? '[class*="ArtistCard"], .artist, main header'
     : '[class*="PlaylistCard"], .playlist, main header';
   const candidates = [...document.querySelectorAll(roots)].flatMap(root => [...root.querySelectorAll('button')]);
   const play = candidates.find(b => /воспроизвести|играть|слушать|^play/i.test(b.getAttribute('aria-label') || b.title || b.textContent || ''))
     || document.querySelector('.d-track__start-column .d-track__play')
     || document.querySelector('button[data-testid="play-button"]');
-  if (play && !play.disabled) { play.click(); window.__vasyaClicked = true; return 'clicked'; }
+  if (play && !play.disabled) {
+    window.__vasyaBefore = {playing, signature, time};
+    play.click(); window.__vasyaClicked = true; return 'clicked';
+  }
   if (type !== 'track' && !window.__vasyaNavigated) {
     const link = [...document.querySelectorAll(roots)].flatMap(r => [...r.querySelectorAll('a[href]')])
       .find(a => type === 'artist' ? /\/artist\//.test(a.pathname) : /\/playlists\//.test(a.pathname));
@@ -236,6 +445,7 @@ struct Chrome {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     session: String,
     sequence: u64,
+    native: bool,
 }
 
 fn browser_executable(browser: &str) -> Result<PathBuf> {
@@ -256,6 +466,94 @@ fn browser_executable(browser: &str) -> Result<PathBuf> {
 }
 
 impl Chrome {
+    fn launch_native(
+        executable: &std::path::Path,
+        uri: &str,
+        registry: ProcessRegistry,
+    ) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        {
+            let mut owner = registry.lock().unwrap();
+            if owner.closing {
+                bail!("Помощник завершает работу");
+            }
+            owner.child = Some(
+                Command::new(executable)
+                    .arg("--remote-debugging-address=127.0.0.1")
+                    .arg(format!("--remote-debugging-port={port}"))
+                    .arg(uri)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            );
+            owner.keep_alive = true;
+        }
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(500))
+            .build()?;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(8) {
+            if registry.lock().unwrap().closing {
+                bail!("Помощник завершает работу");
+            }
+            let info = client
+                .get(format!("http://127.0.0.1:{port}/json/version"))
+                .send()
+                .and_then(|r| r.json::<Value>());
+            if let Ok(info) = info {
+                if let Some(endpoint) = info["webSocketDebuggerUrl"].as_str() {
+                    let (mut socket, _) = tungstenite::connect(endpoint)?;
+                    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+                        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+                    }
+                    let targets = rpc(&mut socket, 1, "Target.getTargets", json!({}), None)?;
+                    let page = targets["targetInfos"].as_array().and_then(|list| {
+                        list.iter().find(|t| {
+                            t["type"] == "page"
+                                && t["url"]
+                                    .as_str()
+                                    .is_some_and(|u| u.starts_with("music-application:"))
+                        })
+                    });
+                    if let Some(page) = page {
+                        let attached = rpc(
+                            &mut socket,
+                            2,
+                            "Target.attachToTarget",
+                            json!({"targetId":page["targetId"],"flatten":true}),
+                            None,
+                        )?;
+                        return Ok(Self {
+                            process: registry,
+                            socket,
+                            session: attached["sessionId"]
+                                .as_str()
+                                .context("Нет сессии приложения")?
+                                .into(),
+                            sequence: 3,
+                            native: true,
+                        });
+                    }
+                }
+            }
+            let exited = registry
+                .lock()
+                .unwrap()
+                .child
+                .as_mut()
+                .is_none_or(|p| p.try_wait().ok().flatten().is_some());
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        bail!("Клиент не предоставил управление воспроизведением")
+    }
+
     fn launch(browser: &str, registry: ProcessRegistry) -> Result<Self> {
         let executable = browser_executable(browser)?;
         let profile = crate::config::data_dir().join("browser").join(browser);
@@ -282,6 +580,7 @@ impl Chrome {
                 bail!("Помощник завершает работу");
             }
             owner.child = Some(command.spawn()?);
+            owner.keep_alive = false;
         }
         let result = (|| -> Result<(WebSocket<MaybeTlsStream<TcpStream>>, String)> {
             let start = Instant::now();
@@ -355,6 +654,7 @@ impl Chrome {
                 socket,
                 session,
                 sequence: 4,
+                native: false,
             }),
             Err(err) => {
                 if let Some(mut process) = registry.lock().unwrap().child.take() {
@@ -385,7 +685,7 @@ impl Chrome {
     }
     fn navigate(&mut self, url: &str) -> Result<()> {
         // Reset SPA flags even if navigation does not create a new JS context.
-        let _ = self.evaluate("window.__vasyaClicked = false; window.__vasyaNavigated = false");
+        let _ = self.evaluate("window.__vasyaClicked = false; window.__vasyaNavigated = false; window.__vasyaFiltered = false");
         let result = self.call("Page.navigate", json!({"url":url}))?;
         if let Some(error) = result["errorText"].as_str() {
             bail!("Браузер: {error}");
@@ -436,6 +736,12 @@ fn rpc(
 
 impl Drop for Chrome {
     fn drop(&mut self) {
+        if self.native {
+            // Disconnect from the user's music client without stopping their music.
+            let _ = self.socket.close(None);
+            self.process.lock().unwrap().child.take();
+            return;
+        }
         let _ = rpc(
             &mut self.socket,
             self.sequence + 1,
@@ -455,6 +761,30 @@ impl Drop for Chrome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_music_links_encode_queries_and_keep_them_inside_the_client() {
+        let query = "Кино & AC/DC #1? трек";
+        let uri = native_music_uri("yandex", query, &Category::Playlist);
+        let url = url::Url::parse(&uri).unwrap();
+        assert_eq!(url.scheme(), "yandexmusic");
+        assert_eq!(url.host_str(), Some("search"));
+        assert_eq!(
+            url.query_pairs().find(|(k, _)| k == "text").unwrap().1,
+            query
+        );
+        assert_eq!(
+            url.query_pairs().find(|(k, _)| k == "type").unwrap().1,
+            "playlist"
+        );
+        assert!(url.fragment().is_none());
+        let spotify = native_music_uri("spotify", query, &Category::Track);
+        assert!(spotify.starts_with("spotify:search:"));
+        assert!(!spotify.contains("#1?"));
+        assert_eq!(
+            native_music_uri("yandex", "", &Category::Track),
+            "yandexmusic://"
+        );
+    }
     #[test]
     fn urls_encode_queries_as_data() {
         let url = url::Url::parse(&search_url("AC/DC & Кино #1")).unwrap();

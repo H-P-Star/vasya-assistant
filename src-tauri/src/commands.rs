@@ -12,6 +12,7 @@ pub enum Category {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Command {
     Music { query: String, category: Category },
+    OpenMusic(String),
     Youtube(String),
     Search(String),
     Generate(String),
@@ -26,6 +27,10 @@ pub enum Command {
     DictationStop,
     Mute,
     Cancel,
+    Answer(String),
+    LaunchApp(String),
+    Disabled,
+    Invalid(String),
     Unknown(String),
 }
 
@@ -129,14 +134,57 @@ pub fn parse(text: &str, dictating: bool, aliases: &[Alias]) -> Command {
     if dictating {
         return Command::Insert(format!("{text} "));
     }
-    for alias in aliases {
-        if normalize(&alias.phrase) == norm {
-            if let Some(command) = alias_command(&alias.action, &alias.payload) {
-                return command;
-            }
+    // Exact overrides win over templates, irrespective of editor row order.
+    let mut ordered: Vec<_> = aliases.iter().filter(|a| a.enabled).collect();
+    ordered.sort_by_key(|a| {
+        (
+            a.phrase.contains("{query}"),
+            std::cmp::Reverse(a.phrase.len()),
+        )
+    });
+    for alias in ordered {
+        let template = alias.phrase.contains("{query}");
+        let captured = if template {
+            let start = normalize(alias.phrase.trim_end_matches("{query}").trim_end());
+            let pattern = start
+                .split_whitespace()
+                .map(|s| regex::escape(s).replace('е', "[её]"))
+                .collect::<Vec<_>>()
+                .join(r"\s+");
+            let pattern = regex::Regex::new(&format!(r"(?i)^{}[\s,:]+(.+)$", pattern)).unwrap();
+            pattern
+                .captures(text)
+                .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+        } else if normalize(&alias.phrase) == norm {
+            Some("")
+        } else {
+            None
+        };
+        if let Some(query) = captured {
+            let payload = if alias.payload.is_empty() {
+                query.to_string()
+            } else {
+                alias.payload.replace("{query}", query)
+            };
+            return alias_command(&alias.action, &payload).unwrap_or(Command::Disabled);
         }
     }
     match norm.as_str() {
+        "включи яндекс музыку" | "открой яндекс музыку" | "запусти яндекс музыку" => {
+            return Command::OpenMusic("yandex".into())
+        }
+        "включи spotify"
+        | "открой spotify"
+        | "запусти spotify"
+        | "включи спотифай"
+        | "открой спотифай" => return Command::OpenMusic("spotify".into()),
+        "включи музыку" | "запусти музыку" | "открой музыку" | "включи" =>
+        {
+            return Command::Music {
+                query: String::new(),
+                category: Category::Track,
+            };
+        }
         "пауза" | "поставь на паузу" | "останови музыку" => {
             return Command::Pause
         }
@@ -163,7 +211,7 @@ pub fn parse(text: &str, dictating: bool, aliases: &[Alias]) -> Command {
         if let Some(value) = parse_percent(caps[1].trim()) {
             return Command::Volume(value);
         }
-        return Command::Unknown("Громкость должна быть от 0 до 100".into());
+        return Command::Invalid("Громкость должна быть от 0 до 100".into());
     }
     if let Some(body) = prefix(text, &["напиши", "пиши"]) {
         return Command::Generate(body.into());
@@ -246,9 +294,13 @@ fn alias_command(action: &str, payload: &str) -> Option<Command> {
     Some(match action {
         "search" => Command::Search(payload.into()),
         "youtube" => Command::Youtube(payload.into()),
-        "music" => Command::Music {
+        "music" | "music_artist" | "music_playlist" => Command::Music {
             query: payload.into(),
-            category: Category::Track,
+            category: match action {
+                "music_artist" => Category::Artist,
+                "music_playlist" => Category::Playlist,
+                _ => Category::Track,
+            },
         },
         "generate" => Command::Generate(payload.into()),
         "insert" => Command::Insert(payload.into()),
@@ -256,6 +308,22 @@ fn alias_command(action: &str, payload: &str) -> Option<Command> {
         "resume" => Command::Resume,
         "next" => Command::Next,
         "mute" => Command::Mute,
+        "volume_up" => Command::VolumeUp,
+        "volume_down" => Command::VolumeDown,
+        "volume" => payload
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|v| *v <= 100)
+            .map(Command::Volume)
+            .unwrap_or_else(|| {
+                Command::Invalid("Громкость должна быть целым числом от 0 до 100".into())
+            }),
+        "dictation_start" => Command::DictationStart,
+        "dictation_stop" => Command::DictationStop,
+        "answer" => Command::Answer(payload.into()),
+        "disabled" => Command::Disabled,
+        "launch_app" => Command::LaunchApp(payload.into()),
         _ => return None,
     })
 }
@@ -263,6 +331,81 @@ fn alias_command(action: &str, payload: &str) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_rules_override_templates_and_can_be_disabled() {
+        let mut rules = vec![
+            Alias {
+                enabled: true,
+                phrase: "Включи {query}".into(),
+                action: "search".into(),
+                payload: "{query} официальный сайт".into(),
+            },
+            Alias {
+                enabled: true,
+                phrase: "включи музыку".into(),
+                action: "disabled".into(),
+                payload: String::new(),
+            },
+        ];
+        assert_eq!(parse("Включи музыку!", false, &rules), Command::Disabled);
+        assert_eq!(
+            parse("Включи  IPv6 & Кино", false, &rules),
+            Command::Search("IPv6 & Кино официальный сайт".into())
+        );
+        assert!(matches!(
+            parse("включиfoo", false, &rules),
+            Command::Unknown(_)
+        ));
+        rules[0].enabled = false;
+        assert!(matches!(
+            parse("включи Кино", false, &rules),
+            Command::Music { .. }
+        ));
+        rules.clear();
+        assert_eq!(
+            parse("открой Яндекс Музыку", false, &rules),
+            Command::OpenMusic("yandex".into())
+        );
+        assert_eq!(
+            parse("открой Spotify", false, &rules),
+            Command::OpenMusic("spotify".into())
+        );
+        assert_eq!(
+            parse("включи музыку", false, &rules),
+            Command::Music {
+                query: String::new(),
+                category: Category::Track
+            }
+        );
+    }
+    #[test]
+    fn longer_template_wins_and_dictation_remains_literal() {
+        let rules = vec![
+            Alias {
+                enabled: true,
+                phrase: "мой {query}".into(),
+                action: "search".into(),
+                payload: String::new(),
+            },
+            Alias {
+                enabled: true,
+                phrase: "мой плейлист {query}".into(),
+                action: "music_playlist".into(),
+                payload: String::new(),
+            },
+        ];
+        assert_eq!(
+            parse("мой плейлист Для работы", false, &rules),
+            Command::Music {
+                query: "Для работы".into(),
+                category: Category::Playlist
+            }
+        );
+        assert_eq!(
+            parse("мой плейлист Работа", true, &rules),
+            Command::Insert("мой плейлист Работа ".into())
+        );
+    }
     #[test]
     fn generation_is_distinct_from_dictation_and_preserves_case() {
         assert_eq!(
@@ -315,9 +458,10 @@ mod tests {
         );
         assert!(matches!(
             parse("громкость 999", false, &[]),
-            Command::Unknown(_)
+            Command::Invalid(_)
         ));
         let alias = Alias {
+            enabled: true,
             phrase: "мой трек".into(),
             action: "music".into(),
             payload: "Перемен".into(),
@@ -360,7 +504,7 @@ mod tests {
             "громкость 101",
         ] {
             assert!(
-                matches!(parse(phrase, false, &[]), Command::Unknown(_)),
+                matches!(parse(phrase, false, &[]), Command::Invalid(_)),
                 "{phrase}"
             );
         }

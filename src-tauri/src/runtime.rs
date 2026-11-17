@@ -23,6 +23,9 @@ pub trait Platform: Send + Sync + 'static {
     fn media(&self, action: &str) -> Result<()>;
     fn volume(&self, value: Option<u8>, delta: f32) -> Result<()>;
     fn speak(&self, text: &str) -> Result<()>;
+    fn launch_app(&self, _: &str) -> Result<()> {
+        bail!("Запуск приложений доступен только в Windows")
+    }
 }
 
 pub struct Shared {
@@ -98,6 +101,7 @@ impl Shared {
         }
         self.target.store(self.platform.foreground(), SeqCst);
         self.activate.store(true, SeqCst);
+        self.emit("activated", "Слушаю команду…");
     }
 }
 
@@ -182,6 +186,7 @@ impl Runtime {
                         Ok(message) => {
                             state.emit("info", &message);
                             if state.snapshot().voice_feedback
+                                && message != "Ответ готов в окне помощника"
                                 && !state.stop.load(SeqCst)
                                 && !(state.dictating.load(SeqCst) && message == "Текст вставлен")
                                 && !state.capture_open.load(SeqCst)
@@ -321,10 +326,20 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
     }
     state.emit("heard", &text);
     state.emit("status", "Выполняю команду");
-    match commands::parse(&text, dictating, &settings.aliases) {
+    let mut command = commands::parse(&text, dictating, &settings.aliases);
+    if matches!(command, Command::Unknown(_)) && settings.llm_fallback {
+        state.emit("status", "Обращаюсь к модели…");
+        command = crate::generator::resolve(&settings, &text, || state.cancelled(epoch))?;
+        if state.cancelled(epoch) {
+            bail!("Команда отменена");
+        }
+        state.emit("status", "Выполняю команду");
+    }
+    match command {
         Command::Search(query) => { browser::open_external(&browser::search_url(&query))?; Ok("Открыт поиск в браузере".into()) }
         Command::Youtube(query) => browser::youtube(&query),
         Command::Music { query, category } => music.play(&settings, &query, &category),
+        Command::OpenMusic(service) => music.login(&Settings { music_service: service, ..settings }),
         Command::Generate(prompt) => {
             let output = crate::generator::generate_with_cancel(&settings, &prompt, || state.cancelled(epoch))?;
             insert_if_current(state, &output, target, epoch, preview)?;
@@ -334,8 +349,8 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
             insert_if_current(state, &text, target, epoch, preview)?;
             Ok(if preview { "Текст готов в окне результата" } else { "Текст вставлен" }.into())
         }
-        Command::Pause | Command::Resume | Command::Next => {
-            let action = match commands::parse(&text, false, &settings.aliases) {
+        action @ (Command::Pause | Command::Resume | Command::Next) => {
+            let action = match action {
                 Command::Pause => "pause", Command::Resume => "resume", _ => "next",
             };
             state.platform.media(action)?;
@@ -353,6 +368,18 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
         Command::DictationStop => { state.dictating.store(false, SeqCst); Ok("Диктовка завершена".into()) }
         Command::Mute => { state.set_muted(true); Ok("Микрофон отключён".into()) }
         Command::Cancel => { state.dictating.store(false, SeqCst); Ok("Отменено".into()) }
+        Command::Answer(answer) => {
+            state.emit("result", &answer);
+            state.emit("answer", &answer);
+            if settings.voice_feedback && !state.capture_open.load(SeqCst) && !state.cancelled(epoch) {
+                let brief: String = answer.chars().take(1200).collect();
+                state.platform.speak(&brief)?;
+            }
+            Ok("Ответ готов в окне помощника".into())
+        }
+        Command::LaunchApp(path) => { state.platform.launch_app(&path)?; Ok("Приложение открыто".into()) }
+        Command::Disabled => Ok("Эта команда отключена в настройках".into()),
+        Command::Invalid(reason) => bail!("{reason}"),
         Command::Unknown(_) => bail!("Команда не распознана. Примеры: «включи Кино», «найди IPv6», «напиши, что такое IPv6»."),
     }
 }
@@ -373,6 +400,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         inserted: Mutex<Vec<String>>,
+        media_actions: Mutex<Vec<String>>,
     }
     impl Platform for Fake {
         fn foreground(&self) -> isize {
@@ -382,7 +410,8 @@ mod tests {
             self.inserted.lock().unwrap().push(text.into());
             Ok(())
         }
-        fn media(&self, _: &str) -> Result<()> {
+        fn media(&self, action: &str) -> Result<()> {
+            self.media_actions.lock().unwrap().push(action.into());
             Ok(())
         }
         fn volume(&self, _: Option<u8>, _: f32) -> Result<()> {
@@ -391,6 +420,132 @@ mod tests {
         fn speak(&self, _: &str) -> Result<()> {
             Ok(())
         }
+    }
+    struct UnusedMusic;
+    impl MusicService for UnusedMusic {
+        fn play(&mut self, _: &Settings, _: &str, _: &crate::commands::Category) -> Result<String> {
+            panic!("This intent must not launch music")
+        }
+    }
+    impl MusicServiceExt for UnusedMusic {
+        fn login(&mut self, _: &Settings) -> Result<String> {
+            panic!("No login expected")
+        }
+    }
+    fn text_task(text: &str) -> Task {
+        Task::Text {
+            text: text.into(),
+            target: 1,
+            epoch: 0,
+            preview: false,
+            samples: None,
+            had_wake: false,
+            dictating: false,
+        }
+    }
+    #[test]
+    fn unknown_phrase_executes_resolved_media_action_and_answers_without_inserting() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        for plan in [
+            r#"{"action":"pause"}"#,
+            r#"{"action":"answer","text":"IPv6 — протокол."}"#,
+        ] {
+            let server = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.local_addr().unwrap());
+            let response =
+                serde_json::json!({"choices":[{"message":{"content":plan}}]}).to_string();
+            let thread = std::thread::spawn(move || {
+                let (mut stream, _) = server.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let size = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|s| s.trim().parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        if body.len() >= size {
+                            break;
+                        }
+                    }
+                }
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
+            });
+            let platform = Arc::new(Fake::default());
+            let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+            let log = events.clone();
+            let runtime = Runtime::start(
+                Settings {
+                    llm_url: url,
+                    voice_feedback: false,
+                    ..Settings::default()
+                },
+                platform.clone(),
+                Arc::new(move |e| log.lock().unwrap().push(e)),
+            );
+            execute(
+                &runtime.shared,
+                &mut UnusedMusic,
+                text_task("пожалуйста сделай как я попросил"),
+            )
+            .unwrap();
+            thread.join().unwrap();
+            assert!(platform.inserted.lock().unwrap().is_empty());
+            if plan.contains("pause") {
+                assert_eq!(*platform.media_actions.lock().unwrap(), vec!["pause"]);
+            } else {
+                assert!(events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == "result" && e.text == "IPv6 — протокол."));
+            }
+            runtime.close();
+        }
+    }
+    #[test]
+    fn disabled_fallback_and_invalid_commands_do_not_contact_a_model() {
+        let runtime = Runtime::start(
+            Settings {
+                llm_fallback: false,
+                llm_url: "http://127.0.0.1:1".into(),
+                ..Settings::default()
+            },
+            Arc::new(Fake::default()),
+            Arc::new(|_| {}),
+        );
+        assert!(execute(
+            &runtime.shared,
+            &mut UnusedMusic,
+            text_task("необычная просьба")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("не распознана"));
+        runtime.shared.settings.write().unwrap().llm_fallback = true;
+        assert!(execute(
+            &runtime.shared,
+            &mut UnusedMusic,
+            text_task("громкость 999")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Громкость"));
+        runtime.close();
     }
     #[test]
     fn first_run_cannot_enable_background_capture_before_completion() {

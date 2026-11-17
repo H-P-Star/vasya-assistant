@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "island-events",
+  "description": "The local activation overlay only subscribes to assistant events",
+  "windows": ["island"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

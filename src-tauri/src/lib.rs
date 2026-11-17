@@ -10,5 +10,7 @@ pub mod speech;
 pub mod audio;
 #[cfg(all(windows, feature = "desktop"))]
 pub mod desktop;
+#[cfg(all(windows, feature = "desktop"))]
+pub mod island;
 #[cfg(windows)]
 pub mod platform;

@@ -26,10 +26,16 @@ pub enum LlmProvider {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alias {
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     pub phrase: String,
     pub action: String,
     #[serde(default)]
     pub payload: String,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +53,11 @@ pub struct Settings {
     pub whisper_model: String,
     pub music_service: String,
     pub browser: String,
+    pub music_mode: String,
+    pub yandex_app_path: String,
+    pub spotify_app_path: String,
+    pub island_enabled: bool,
+    pub llm_fallback: bool,
     pub voice_feedback: bool,
     pub start_muted: bool,
     pub start_in_tray: bool,
@@ -79,6 +90,11 @@ impl Default for Settings {
             whisper_model: String::new(),
             music_service: "yandex".into(),
             browser: "edge".into(),
+            music_mode: "desktop".into(),
+            yandex_app_path: String::new(),
+            spotify_app_path: String::new(),
+            island_enabled: true,
+            llm_fallback: true,
             voice_feedback: true,
             start_muted: false,
             start_in_tray: false,
@@ -122,15 +138,92 @@ impl Settings {
         if self.llm_model.trim().is_empty() {
             bail!("Укажите модель генерации текста");
         }
+        if !["desktop", "browser"].contains(&self.music_mode.as_str()) {
+            bail!("Неизвестный способ запуска музыки");
+        }
+        if self.aliases.len() > 256 {
+            bail!("Можно сохранить до 256 команд");
+        }
+        let mut phrases = std::collections::HashSet::new();
         for alias in &self.aliases {
+            let normalized = crate::commands::normalize(&alias.phrase);
+            if !phrases.insert(normalized) {
+                bail!("Команда «{}» встречается несколько раз", alias.phrase);
+            }
+            if alias.phrase.len() > 512 || alias.payload.len() > 16000 {
+                bail!("Слишком длинная команда");
+            }
+            if alias.phrase.contains("{query}")
+                && (!alias.phrase.ends_with("{query}")
+                    || alias.phrase.matches("{query}").count() != 1
+                    || alias
+                        .phrase
+                        .trim_end_matches("{query}")
+                        .chars()
+                        .last()
+                        .is_none_or(|c| !c.is_whitespace()))
+            {
+                bail!(
+                    "Параметр {{query}} должен находиться один раз в конце фразы после её названия"
+                );
+            }
             if alias.phrase.trim().is_empty()
                 || ![
-                    "search", "music", "youtube", "generate", "insert", "pause", "resume", "next",
+                    "search",
+                    "music",
+                    "music_artist",
+                    "music_playlist",
+                    "youtube",
+                    "generate",
+                    "insert",
+                    "pause",
+                    "resume",
+                    "next",
+                    "volume",
                     "mute",
+                    "volume_up",
+                    "volume_down",
+                    "dictation_start",
+                    "dictation_stop",
+                    "answer",
+                    "disabled",
+                    "launch_app",
                 ]
                 .contains(&alias.action.as_str())
             {
                 bail!("Некорректный пользовательский псевдоним команды");
+            }
+            if alias.action == "volume"
+                && !alias.payload.contains("{query}")
+                && alias
+                    .payload
+                    .trim()
+                    .parse::<u8>()
+                    .ok()
+                    .is_none_or(|v| v > 100)
+            {
+                bail!(
+                    "В содержимом команды громкости укажите целое число от 0 до 100 или {{query}}"
+                );
+            }
+            if alias.action == "launch_app"
+                && (alias.payload.contains("{query}") || alias.phrase.contains("{query}"))
+            {
+                bail!("Для запуска программы укажите точную фразу и постоянный путь к .exe");
+            }
+            if [
+                "search",
+                "youtube",
+                "generate",
+                "insert",
+                "answer",
+                "launch_app",
+            ]
+            .contains(&alias.action.as_str())
+                && alias.payload.trim().is_empty()
+                && !alias.phrase.contains("{query}")
+            {
+                bail!("Заполните содержимое действия команды «{}»", alias.phrase);
             }
         }
         Ok(())
@@ -174,6 +267,48 @@ pub fn save(settings: &Settings, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_settings_keep_aliases_and_new_features_have_defaults() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"aliases":[{"phrase":"моя музыка","action":"music","payload":"Кино"}]}"#,
+        )
+        .unwrap();
+        settings.validate().unwrap();
+        assert!(settings.aliases[0].enabled);
+        assert_eq!(settings.music_mode, "desktop");
+        assert!(settings.llm_fallback && settings.island_enabled);
+    }
+    #[test]
+    fn duplicate_and_unsafe_command_templates_are_rejected() {
+        let mut settings = Settings::default();
+        let rule = Alias {
+            enabled: true,
+            phrase: "Тест".into(),
+            action: "pause".into(),
+            payload: String::new(),
+        };
+        settings.aliases = vec![
+            rule.clone(),
+            Alias {
+                phrase: "тест!".into(),
+                ..rule.clone()
+            },
+        ];
+        assert!(settings.validate().is_err());
+        for phrase in ["{query}", "мой {query} запрос", "мой {query} {query}"] {
+            settings.aliases = vec![Alias {
+                phrase: phrase.into(),
+                ..rule.clone()
+            }];
+            assert!(settings.validate().is_err(), "{phrase}");
+        }
+        settings.aliases = vec![Alias {
+            phrase: "запусти {query}".into(),
+            action: "launch_app".into(),
+            ..rule
+        }];
+        assert!(settings.validate().is_err());
+    }
     #[test]
     fn packaged_paths_follow_installation_and_preserve_custom_paths() {
         let mut settings = Settings::default();

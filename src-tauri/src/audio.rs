@@ -231,6 +231,8 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
     let mut utterance = Vec::new();
     let mut epoch = state.epoch.load(SeqCst);
     let mut status = String::new();
+    let mut wake_previewed = false;
+    let mut partial_at = Instant::now();
     while !state.stop.load(SeqCst) && state.config_version.load(SeqCst) == version {
         let now = Instant::now();
         if epoch != state.epoch.load(SeqCst) {
@@ -238,6 +240,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             gate.reset();
             vosk.reset();
             utterance.clear();
+            wake_previewed = false;
             input = None;
             state.capture_open.store(false, SeqCst);
         }
@@ -246,6 +249,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             input = None;
             state.capture_open.store(false, SeqCst);
             gate.arm(now);
+            wake_previewed = false;
             vosk.reset();
             utterance.clear();
         }
@@ -277,6 +281,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             state.capture_open.store(false, SeqCst);
             vosk.reset();
             utterance.clear();
+            wake_previewed = false;
             if muted || busy {
                 gate.reset();
             }
@@ -300,6 +305,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
         utterance.extend_from_slice(&samples);
         if utterance.len() > 16000 * 30 {
             utterance.clear();
+            wake_previewed = false;
             vosk.reset();
             gate.reset();
             state.emit(
@@ -312,12 +318,18 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             let had_wake = !dictating && strip_wake(&text, &settings.wake_words).is_some();
             match gate.accept(&text, dictating, Instant::now()) {
                 Accepted::Wake => {
-                    state.target.store(state.platform.foreground(), SeqCst);
+                    if !wake_previewed {
+                        state.target.store(state.platform.foreground(), SeqCst);
+                    }
+                    state.emit("activated", "Слушаю команду…");
                     state.emit("status", "Слушаю команду…");
                 }
                 Accepted::Command(body) => {
                     if had_wake {
-                        state.target.store(state.platform.foreground(), SeqCst);
+                        if !wake_previewed {
+                            state.target.store(state.platform.foreground(), SeqCst);
+                        }
+                        state.emit("activated", "Слушаю команду…");
                     }
                     let target = state.target.load(SeqCst);
                     if state
@@ -343,9 +355,28 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
                         }
                     }
                 }
-                Accepted::Ignore => {}
+                Accepted::Ignore => {
+                    if wake_previewed {
+                        state.emit("deactivated", "");
+                    }
+                }
             }
             utterance.clear();
+            wake_previewed = false;
+        } else if !wake_previewed
+            && !dictating
+            && !gate.armed(Instant::now())
+            && settings.activation != Activation::Hotkey
+            && partial_at.elapsed() >= Duration::from_millis(200)
+        {
+            partial_at = Instant::now();
+            // A partial hypothesis may show the UI, but only the final transcript
+            // can arm the gate or execute a command.
+            if strip_wake(&vosk.partial()?, &settings.wake_words).is_some() {
+                wake_previewed = true;
+                state.target.store(state.platform.foreground(), SeqCst);
+                state.emit("activated", "Слушаю команду…");
+            }
         }
     }
     drop(input);

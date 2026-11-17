@@ -4966,10 +4966,11 @@ dependencies = [
 
 [[package]]
 name = "vasya-assistant"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "cpal",
+ "dunce",
  "libloading 0.8.9",
  "regex",
  "reqwest 0.12.28",

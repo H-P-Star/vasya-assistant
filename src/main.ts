@@ -1,16 +1,20 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import './style.css';
+import { startIsland } from './island';
 
 type Activation = 'wake' | 'hotkey' | 'both';
+type Alias = {enabled: boolean; phrase: string; action: string; payload: string};
 type Settings = {
   onboarding_complete: boolean;
   wake_words: string[]; activation: Activation; hotkey: string; microphone: string;
   vosk_library: string; vosk_model: string; speech_mode: 'vosk' | 'whisper';
   whisper_executable: string; whisper_model: string; music_service: string; browser: string;
+  music_mode: 'desktop' | 'browser'; yandex_app_path: string; spotify_app_path: string;
+  island_enabled: boolean; llm_fallback: boolean;
   voice_feedback: boolean; start_muted: boolean; start_in_tray: boolean; command_timeout: number;
   llm_provider: 'lm_studio' | 'ollama'; llm_url: string; llm_model: string;
-  aliases: {phrase: string; action: string; payload: string}[];
+  aliases: Alias[];
 };
 type Snapshot = {speech_ready: boolean; settings: Settings; muted: boolean; busy: boolean; capture_open: boolean;
   data_directory: string; errors: string[]; status: string; last_error: string | null};
@@ -20,7 +24,8 @@ const native = isTauri();
 let settings: Settings = {
   onboarding_complete: false, wake_words: ['вась', 'вася'], activation: 'both', hotkey: 'Ctrl+Alt+Space', microphone: '',
   vosk_library: '', vosk_model: '', speech_mode: 'vosk', whisper_executable: '', whisper_model: '',
-  music_service: 'yandex', browser: 'edge', voice_feedback: true, start_muted: false,
+  music_service: 'yandex', browser: 'edge', music_mode: 'desktop', yandex_app_path: '', spotify_app_path: '',
+  island_enabled: true, llm_fallback: true, voice_feedback: true, start_muted: false,
   start_in_tray: false, command_timeout: 10, llm_provider: 'lm_studio', llm_url: 'http://198.18.0.1:1234',
   llm_model: 'google/gemma-3-4b', aliases: [],
 };
@@ -29,7 +34,8 @@ let muted = false;
 let busy = false;
 let captureOpen = false;
 let status = native ? 'Подключаюсь к помощнику…' : 'Предпросмотр интерфейса';
-let page: 'home' | 'settings' | 'help' = 'home';
+let page: 'home' | 'settings' | 'commands' | 'help' = 'home';
+let aliasDraft: Alias[] | undefined;
 let error = '';
 let result = '';
 let heard = '';
@@ -109,9 +115,10 @@ function shell() {
       <nav aria-label="Основная навигация">
         <button data-page="home">${icon('home')}<span>Помощник</span></button>
         <button data-page="settings">${icon('settings')}<span>Настройки</span></button>
+        <button data-page="commands">${icon('key')}<span>Мои команды</span></button>
         <button data-page="help">${icon('help')}<span>Команды и помощь</span></button>
       </nav>
-      <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<strong>Обработка на устройстве</strong><p>Речь распознаётся локально.<br>Ваш голос остаётся у вас.</p></div><span class="version">Вася для Windows <span>0.2.1</span></span></div>
+      <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<strong>Обработка на устройстве</strong><p>Речь распознаётся локально.<br>Ваш голос остаётся у вас.</p></div><span class="version">Вася для Windows <span>0.3.0</span></span></div>
     </aside>
     <main><div id="preview" ${native ? 'hidden' : ''}>Предпросмотр интерфейса · для работы с голосом запустите Windows-приложение</div><div id="content"></div></main>
     <div id="toast" role="status" aria-live="polite"></div>`;
@@ -133,7 +140,7 @@ function render() {
       <label class="field">Микрофон<select id="microphone"></select></label>
       <button id="test-mic" class="secondary">Проверить микрофон · 2 секунды</button><p id="mic-test" role="status">Нажмите кнопку и произнесите несколько слов. Команды во время проверки не выполняются.</p>
       <h2>2. Начните пользоваться</h2><p>Скажите «Вася, громче» или нажмите <kbd>${esc(settings.hotkey)}</kbd> и скажите «найди погоду».</p>
-      <p>Для музыки выберите сервис в настройках и войдите в аккаунт. Генерацию текста через LM Studio или Ollama можно подключить позже — обычные команды работают без них.</p>
+      <p>Для музыки выберите сервис в настройках и войдите в аккаунт. Модель для генерации и ответов через LM Studio или Ollama можно подключить позже — обычные команды работают без них.</p>
       <button id="finish-setup" class="primary" ${native && speechReady ? '' : 'disabled'}>Начать пользоваться</button></section>`;
     fillDevices();
     $('test-mic').onclick = async () => {
@@ -225,12 +232,18 @@ function render() {
       $('llm-models').textContent = '';
     };
     updateWhisper();
+  } else if (page === 'commands') {
+    $('content').innerHTML = top('Ваши слова. Ваши команды.', 'Меняйте привычные фразы и добавляйте свои действия.') + commandEditor();
+    bindCommandEditor();
   } else {
     $('content').innerHTML = top('Скажите — и готово.', 'Справочник команд и короткая инструкция по запуску.') + `
-      <section class="help-card"><h2>Первый запуск</h2><ol><li>Установите Васю из полного установщика .exe в GitHub Releases. Vosk и русская модель уже включены.</li><li>При первом запуске выберите и проверьте микрофон, затем нажмите «Начать пользоваться».</li><li>Для генерации запустите сервер LM Studio с моделью <code>google/gemma-3-4b</code>. Проверьте подключение в настройках; альтернативно можно выбрать Ollama.</li><li>Для музыки нажмите «Войти в сервис» в настройках. Музыкальный профиль браузера хранится отдельно.</li></ol></section>
+      <section class="help-card"><h2>Первый запуск</h2><ol><li>Установите Васю из полного установщика .exe в GitHub Releases. Vosk и русская модель уже включены.</li><li>При первом запуске выберите и проверьте микрофон, затем нажмите «Начать пользоваться».</li><li>Для генерации запустите сервер LM Studio с моделью <code>google/gemma-3-4b</code>. Проверьте подключение в настройках; альтернативно можно выбрать Ollama.</li><li>Для музыки выберите сервис и нажмите «Открыть музыкальный сервис» в настройках. По умолчанию используется установленное приложение.</li></ol></section>
       <section class="help-card"><h2>Команды</h2><table><thead><tr><th>Задача</th><th>После «Вась» или горячей клавиши</th></tr></thead><tbody>
       ${[
         ['Музыка', 'включи трек Перемен / исполнителя Кино / плейлист Работа'],
+        ['Музыкальное приложение', 'открой Яндекс Музыку / открой Spotify'],
+        ['Свои команды', 'Добавьте фразы и действия во вкладке «Мои команды»'],
+        ['Вопрос модели', 'расскажи, что такое IPv6 (при включённом обращении к модели)'],
         ['Воспроизведение', 'пауза / продолжи / следующий трек'],
         ['Громкость', 'громче / тише / громкость 35 процентов'],
         ['Поиск', 'найди в браузере что такое IPv6'],
@@ -240,10 +253,68 @@ function render() {
         ['Генерация текста', 'напиши, что такое IPv6'],
         ['Микрофон', 'отключи микрофон (включение — кнопкой или через трей)'],
       ].map(([a,b]) => `<tr><td>${a}</td><td>${b}</td></tr>`).join('')}</tbody></table></section>
-      <section class="help-card"><h2>Как это работает</h2><p>Можно произнести слово и команду одной фразой или позвать Васю, дождаться статуса «Слушаю команду» и продолжить. В режиме горячей клавиши устройство захвата открывается на время команды.</p><p>Для диктовки и генерации сначала поставьте курсор в нужное приложение, затем активируйте помощника. Если окно изменилось, текст останется в результате. Горячая клавиша также завершает непрерывную диктовку.</p><p>Vosk распознаёт слова активации обычным распознаванием речи. Это не отдельный детектор: возможны пропуски и ложные срабатывания. Whisper уточняет уже активированные фразы локально. Запросы к музыкальным сервисам, YouTube и поиску требуют интернета.</p><p>Пауза и продолжение адресуются текущей медиасессии Windows. На сайтах возможны ограничения автозапуска, входа и подписки. Помощник сообщает, если открыл только поиск.</p><p>Настройки и профиль: <code>${esc(dataDirectory)}</code>. Аудио не сохраняется постоянно; временный WAV для Whisper удаляется после обработки. История действий хранится только в памяти окна.</p></section>`;
+      <section class="help-card"><h2>Как это работает</h2><p>Можно произнести слово и команду одной фразой или позвать Васю, дождаться статуса «Слушаю команду» и продолжить. В режиме горячей клавиши устройство захвата открывается на время команды.</p><p>Для диктовки и генерации сначала поставьте курсор в нужное приложение, затем активируйте помощника. Если окно изменилось, текст останется в результате. Горячая клавиша также завершает непрерывную диктовку.</p><p>Vosk распознаёт слова активации обычным распознаванием речи. Это не отдельный детектор: возможны пропуски и ложные срабатывания. Whisper уточняет уже активированные фразы локально. Запросы к музыкальным сервисам, YouTube и поиску требуют интернета.</p><p>Пауза и продолжение адресуются текущей медиасессии Windows. В музыкальных приложениях и на сайтах возможны ограничения автозапуска, входа и подписки. Помощник сообщает, если открыл только поиск.</p><p>Настройки и профиль: <code>${esc(dataDirectory)}</code>. Аудио не сохраняется постоянно; временный WAV для Whisper удаляется после обработки. История действий хранится только в памяти окна.</p></section>`;
   }
   showError();
   $('dismiss-error').onclick = () => { error = ''; showError(); };
+}
+
+const commandActions: Record<string, string> = {
+  music: 'Включить трек', music_artist: 'Включить исполнителя', music_playlist: 'Включить плейлист',
+  search: 'Поиск в браузере', youtube: 'Видео YouTube', generate: 'Сгенерировать текст',
+  insert: 'Вставить текст', answer: 'Ответить фразой', launch_app: 'Открыть программу (.exe)',
+  pause: 'Пауза', resume: 'Продолжить музыку', next: 'Следующий трек', volume: 'Громкость 0–100',
+  volume_up: 'Громче', volume_down: 'Тише', dictation_start: 'Начать диктовку',
+  dictation_stop: 'Завершить диктовку', mute: 'Отключить микрофон', disabled: 'Не выполнять эту фразу',
+};
+function commandEditor() {
+  aliasDraft ??= structuredClone(settings.aliases);
+  return `<section class="settings-card command-intro"><h2>Как добавить команду</h2>
+    <p>Укажите фразу без слова «Вася», выберите действие и его содержимое. Своя фраза имеет приоритет над встроенной.</p>
+    <p>Для переменной части используйте <code>{query}</code> в конце фразы. Например: «поищи {query}» → поиск. В содержимом можно написать «{query} официальный сайт» или оставить его пустым для передачи запроса целиком.</p>
+    <p>Чтобы изменить встроенную команду, добавьте ту же фразу со своим действием. Действие «Не выполнять эту фразу» блокирует её. Удаление правила возвращает встроенное поведение.</p>
+    <div class="command-toolbar"><button id="add-command" class="primary">+ Добавить команду</button><button id="add-template" class="secondary">Пример с запросом</button></div></section>
+    <form id="commands-form"><div id="command-rows"></div><div class="save-row"><span id="command-save-note">Изменения применятся после сохранения.</span><button class="primary" type="submit">Сохранить команды ${icon('arrow',17)}</button></div></form>`;
+}
+function renderCommandRows() {
+  const rows = aliasDraft!;
+  $('command-rows').innerHTML = rows.length ? rows.map((row, index) => `<section class="settings-card command-rule" data-rule="${index}">
+    <div class="section-heading"><label class="rule-enabled"><input type="checkbox" data-key="enabled" ${row.enabled ? 'checked' : ''}/> Команда ${index + 1}</label><button type="button" class="text-button delete-rule" aria-label="Удалить команду ${index + 1}">Удалить</button></div>
+    <div class="form-grid"><label class="field">Когда я говорю<input data-key="phrase" value="${esc(row.phrase)}" placeholder="Например: мой плейлист" maxlength="512" required/></label>
+    <label class="field">Вася должен<select data-key="action">${Object.entries(commandActions).map(([key,label]) => `<option value="${key}" ${row.action === key ? 'selected' : ''}>${label}</option>`).join('')}</select></label></div>
+    <label class="field rule-payload">Содержимое действия<textarea data-key="payload" maxlength="16000" rows="2" placeholder="Название, запрос, текст или полный путь к .exe">${esc(row.payload)}</textarea><small>Для паузы, переключения, диктовки и отключения микрофона содержимое не требуется.</small></label>
+    </section>`).join('') : '<section class="settings-card command-empty">Пока нет своих команд. Встроенные команды уже работают.</section>';
+  document.querySelectorAll<HTMLElement>('[data-rule]').forEach(section => {
+    const index = Number(section.dataset.rule);
+    section.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('[data-key]').forEach(input => {
+      const update = () => {
+        const key = input.dataset.key!;
+        (rows[index] as Record<string, unknown>)[key] = key === 'enabled' ? (input as HTMLInputElement).checked : input.value;
+        $('command-save-note').textContent = 'Есть несохранённые изменения.';
+      };
+      input.oninput = update; input.onchange = update;
+    });
+    section.querySelector<HTMLButtonElement>('.delete-rule')!.onclick = () => { rows.splice(index,1); renderCommandRows(); };
+  });
+}
+function bindCommandEditor() {
+  renderCommandRows();
+  const add = (template: boolean) => {
+    aliasDraft!.push({enabled:true, phrase: template ? 'поищи {query}' : '', action: template ? 'search' : 'music_playlist', payload:''});
+    renderCommandRows();
+    document.querySelector<HTMLInputElement>('[data-rule]:last-child [data-key="phrase"]')?.focus();
+  };
+  $('add-command').onclick = () => add(false);
+  $('add-template').onclick = () => add(true);
+  $('commands-form').onsubmit = async event => {
+    event.preventDefault();
+    if (!native) { toast('Команды сохраняются в Windows-приложении.'); return; }
+    const next = {...settings, aliases: structuredClone(aliasDraft!).map(a => ({...a, phrase:a.phrase.trim()}))};
+    try {
+      await invoke('save_settings', {settings:next}); settings = next; error = ''; showError();
+      $('command-save-note').textContent = 'Команды сохранены.'; toast('Команды сохранены и готовы к использованию.');
+    } catch (e) { error = String(e); showError(); }
+  };
 }
 
 function field(name: string, label: string, hint = '', type = 'text') {
@@ -254,7 +325,7 @@ function settingsForm() {
     <div class="field"><label for="microphone">Микрофон</label><div class="input-row"><select id="microphone"></select><button type="button" id="refresh-mics" class="secondary small">Обновить</button></div></div>
     <div class="form-grid"><label class="field">Способ активации<select id="activation"><option value="both">Слово и горячая клавиша</option><option value="wake">Только слово</option><option value="hotkey">Только горячая клавиша</option></select></label>${field('hotkey', 'Горячая клавиша', 'Например: Ctrl+Alt+Space')}</div>
     <div class="form-grid">${field('wake_words', 'Слова активации', 'Несколько вариантов через запятую')}${field('command_timeout', 'Ожидание команды, секунд', 'После слова или нажатия клавиши', 'number')}</div>
-    <div class="check-grid"><label><input type="checkbox" id="voice_feedback"/> Голосовое подтверждение</label><label><input type="checkbox" id="start_muted"/> Запускать с выключенным микрофоном</label><label><input type="checkbox" id="start_in_tray"/> Открывать сразу в трее</label></div></section>
+    <div class="check-grid"><label><input type="checkbox" id="voice_feedback"/> Голосовое подтверждение</label><label><input type="checkbox" id="island_enabled"/> Показывать панель активации поверх окон</label><label><input type="checkbox" id="start_muted"/> Запускать с выключенным микрофоном</label><label><input type="checkbox" id="start_in_tray"/> Открывать сразу в трее</label></div></section>
     <section class="settings-card"><div class="card-title">${icon('shield')}<h2>Распознавание речи</h2><span class="tag">Локально</span></div>
     <label class="field">Режим<select id="speech_mode"><option value="vosk">Vosk — быстрые команды и диктовка</option><option value="whisper">Vosk + Whisper — уточнение активированных фраз</option></select></label>
     <p class="form-note">Русское распознавание включено в установщик и готово к работе.</p>
@@ -264,8 +335,10 @@ function settingsForm() {
     <div id="whisper-fields">${field('whisper_executable', 'Путь к whisper-cli.exe')}${field('whisper_model', 'Файл модели Whisper', 'Локальный ggml-base.bin или другая многоязычная модель whisper.cpp')}</div>
     <p class="form-note">Vosk нужен в обоих режимах для активации и определения границ фраз. Базовая русская модель включена в установщик; Whisper настраивается дополнительно.</p></section>
     <section class="settings-card"><div class="card-title">${icon('music')}<h2>Музыка и браузер</h2></div><div class="form-grid"><label class="field">Основной сервис<select id="music_service"><option value="yandex">Яндекс Музыка</option><option value="youtube">YouTube</option><option value="spotify">Spotify</option></select></label><label class="field">Браузер музыкального профиля<select id="browser"><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option></select></label></div>
-    <button id="login" type="button" class="secondary">Войти в сервис ${icon('arrow', 16)}</button><p class="form-note">Сначала сохраните выбранный сервис. Музыка использует отдельный профиль браузера. Поиск и YouTube открываются в браузере по умолчанию.</p></section>
-    <section class="settings-card"><div class="card-title">${icon('key')}<h2>Генерация текста</h2><span class="tag">Своя модель</span></div><label class="field">Провайдер<select id="llm_provider"><option value="lm_studio">LM Studio (совместимый API)</option><option value="ollama">Ollama</option></select></label><div class="form-grid">${field('llm_url', 'Адрес сервера', 'Без /v1 — путь добавляется автоматически')}${field('llm_model', 'Идентификатор модели')}</div><button id="check-llm" type="button" class="secondary">Проверить соединение ${icon('arrow', 16)}</button><p id="llm-models" class="form-note"></p><p class="form-note">Текст запросов «пиши/напиши» отправляется на указанный сервер. Обычные команды и аудио туда не отправляются.</p></section>
+    <label class="field">Где запускать музыку<select id="music_mode"><option value="desktop">В установленном приложении</option><option value="browser">В отдельном музыкальном профиле браузера</option></select></label>
+    <details><summary>Пути к музыкальным приложениям</summary>${field('yandex_app_path','Приложение Яндекс Музыки','Пусто — найти автоматически в LocalAppData\\Programs\\YandexMusic')}${field('spotify_app_path','Приложение Spotify','Пусто — найти автоматически или использовать протокол Spotify')}</details>
+    <button id="login" type="button" class="secondary">Открыть музыкальный сервис ${icon('arrow', 16)}</button><p class="form-note">Сначала сохраните выбранный сервис и способ запуска. Яндекс Музыка и Spotify открываются в своих приложениях; YouTube — в браузере. В Spotify поиск требует выбора результата. Для автозапуска Яндекс Музыки закройте клиент через его трей перед первой командой Васе.</p></section>
+    <section class="settings-card"><div class="card-title">${icon('key')}<h2>Модель и ответы</h2><span class="tag">Своя модель</span></div><label class="field">Провайдер<select id="llm_provider"><option value="lm_studio">LM Studio (совместимый API)</option><option value="ollama">Ollama</option></select></label><div class="form-grid">${field('llm_url', 'Адрес сервера', 'Без /v1 — путь добавляется автоматически')}${field('llm_model', 'Идентификатор модели')}</div><div class="check-grid"><label><input id="llm_fallback" type="checkbox"/> Обращаться к модели, если команда не распознана</label></div><button id="check-llm" type="button" class="secondary">Проверить соединение ${icon('arrow', 16)}</button><p id="llm-models" class="form-note"></p><p class="form-note">Неизвестные фразы и запросы «пиши/напиши» отправляются на указанный сервер. Модель подбирает действие помощника или отвечает; ответы появляются в результате и озвучиваются при включённом подтверждении. Аудио на сервер не отправляется.</p></section>
     <div class="save-row"><span>Настройки применятся после сохранения.</span><button type="submit" class="primary">Сохранить настройки ${icon('arrow', 17)}</button></div></form>`;
 }
 function fillDevices() {
@@ -311,7 +384,6 @@ async function refreshDevices(): Promise<boolean> {
   return true;
 }
 
-shell();
 async function connect() {
   if (!native) return;
   await listen<AssistantEvent>('assistant', ({payload: event}) => {
@@ -350,4 +422,5 @@ async function connect() {
     } catch { /* A transient IPC failure is reported on the next user action. */ }
   }, 1000);
 }
-void connect();
+if (new URLSearchParams(location.search).has('overlay')) { void startIsland(); }
+else { shell(); void connect(); }
