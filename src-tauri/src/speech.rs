@@ -12,6 +12,8 @@ type NewRecognizer = unsafe extern "C" fn(*mut c_void, f32) -> *mut c_void;
 type Accept = unsafe extern "C" fn(*mut c_void, *const i16, c_int) -> c_int;
 type Text = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type Reset = unsafe extern "C" fn(*mut c_void);
+type NewGrammar = unsafe extern "C" fn(*mut c_void, f32, *const c_char) -> *mut c_void;
+type FindWord = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
 
 fn model_path_cstring(model: &Path) -> Result<CString> {
     // Tauri canonicalizes the executable path; Windows then adds a \\?\ prefix.
@@ -56,6 +58,8 @@ pub struct Vosk {
     accept: Accept,
     result: Text,
     partial_result: Text,
+    final_result: Text,
+    wake_recognizer: Option<NonNull<c_void>>,
     reset: Reset,
 }
 
@@ -88,6 +92,7 @@ impl Vosk {
             let accept: Accept = *lib.get(b"vosk_recognizer_accept_waveform_s\0")?;
             let result: Text = *lib.get(b"vosk_recognizer_result\0")?;
             let partial_result: Text = *lib.get(b"vosk_recognizer_partial_result\0")?;
+            let final_result: Text = *lib.get(b"vosk_recognizer_final_result\0")?;
             let reset: Reset = *lib.get(b"vosk_recognizer_reset\0")?;
             let set_log: unsafe extern "C" fn(c_int) = *lib.get(b"vosk_set_log_level\0")?;
             set_log(-1);
@@ -106,6 +111,8 @@ impl Vosk {
                 accept,
                 result,
                 partial_result,
+                final_result,
+                wake_recognizer: None,
                 reset,
             })
         }
@@ -137,6 +144,76 @@ impl Vosk {
 
     pub fn reset(&mut self) {
         unsafe { (self.reset)(self.recognizer.as_ptr()) };
+        self.reset_wake();
+    }
+
+    pub fn configure_wake(&mut self, words: &[String], model_path: &Path) -> Result<()> {
+        // Grammar adaptation requires the dynamic graph shipped by the small model.
+        if !model_path.join("graph/HCLr.fst").is_file() {
+            return Ok(());
+        }
+        unsafe {
+            let find: FindWord = *self._library.get(b"vosk_model_find_word\0")?;
+            let create: NewGrammar = *self._library.get(b"vosk_recognizer_new_grm\0")?;
+            let mut known: Vec<_> = words
+                .iter()
+                .filter(|word| {
+                    word.split_whitespace().all(|w| {
+                        CString::new(w).is_ok_and(|w| find(self.model.as_ptr(), w.as_ptr()) >= 0)
+                    })
+                })
+                .cloned()
+                .collect();
+            if known.is_empty() {
+                return Ok(());
+            }
+            known.push("[unk]".into());
+            let grammar = CString::new(serde_json::to_string(&known)?)?;
+            self.wake_recognizer =
+                NonNull::new(create(self.model.as_ptr(), 16000.0, grammar.as_ptr()));
+        }
+        Ok(())
+    }
+
+    pub fn reset_wake(&mut self) {
+        if let Some(handle) = self.wake_recognizer {
+            unsafe { (self.reset)(handle.as_ptr()) };
+        }
+    }
+
+    pub fn wake(&mut self, samples: &[i16]) -> Result<String> {
+        let Some(handle) = self.wake_recognizer else {
+            return Ok(String::new());
+        };
+        unsafe {
+            let complete = (self.accept)(handle.as_ptr(), samples.as_ptr(), samples.len() as c_int);
+            if complete < 0 {
+                bail!("Ошибка детектора активации Vosk");
+            }
+            let ptr = if complete == 0 {
+                (self.partial_result)(handle.as_ptr())
+            } else {
+                (self.result)(handle.as_ptr())
+            };
+            if ptr.is_null() {
+                return Ok(String::new());
+            }
+            let json: serde_json::Value = serde_json::from_slice(CStr::from_ptr(ptr).to_bytes())?;
+            Ok(json[if complete == 0 { "partial" } else { "text" }]
+                .as_str()
+                .unwrap_or_default()
+                .into())
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<String> {
+        let ptr = unsafe { (self.final_result)(self.recognizer.as_ptr()) };
+        if ptr.is_null() {
+            bail!("Vosk вернула пустой финальный результат");
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(unsafe { CStr::from_ptr(ptr) }.to_bytes())?;
+        Ok(json["text"].as_str().unwrap_or_default().into())
     }
 
     pub fn partial(&mut self) -> Result<String> {
@@ -154,6 +231,9 @@ impl Vosk {
 impl Drop for Vosk {
     fn drop(&mut self) {
         unsafe {
+            if let Some(handle) = self.wake_recognizer {
+                (self.free_recognizer)(handle.as_ptr());
+            }
             (self.free_recognizer)(self.recognizer.as_ptr());
             (self.free_model)(self.model.as_ptr());
         }
@@ -188,6 +268,42 @@ pub fn whisper(
     samples: &[i16],
     cancelled: impl Fn() -> bool,
 ) -> Result<String> {
+    whisper_options(executable, model, samples, "auto", "", cancelled)
+}
+
+pub fn whisper_configured(
+    settings: &crate::config::Settings,
+    samples: &[i16],
+    cancelled: impl Fn() -> bool,
+) -> Result<String> {
+    let names = settings
+        .speech_corrections
+        .iter()
+        .map(|c| c.replacement.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hint: String = format!("Spotify, YouTube, IPv6. {names} {}", settings.speech_hint)
+        .chars()
+        .take(2500)
+        .collect();
+    whisper_options(
+        Path::new(&settings.whisper_executable),
+        Path::new(&settings.whisper_model),
+        samples,
+        &settings.speech_language,
+        &hint,
+        cancelled,
+    )
+}
+
+fn whisper_options(
+    executable: &Path,
+    model: &Path,
+    samples: &[i16],
+    language: &str,
+    hint: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<String> {
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
@@ -200,8 +316,10 @@ pub fn whisper(
     let output = dir.path().join("result");
     write_wav(&wav, samples)?;
     let mut command = Command::new(executable);
+    // Short commands need less encoder context than the model's full 30 s window.
+    let context = ((samples.len() / 16000 + 3) * 50).clamp(512, 1500);
     command
-        .args(["-l", "ru", "-nt", "-np", "-otxt", "-of"])
+        .args(["-l", language, "-nt", "-np", "-otxt", "-of"])
         .arg(&output)
         .arg("-m")
         .arg(model)
@@ -209,6 +327,12 @@ pub fn whisper(
         .arg(wav)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    command
+        .args(["-bs", "5", "-bo", "1", "-mc", "224", "-ac"])
+        .arg(context.to_string());
+    if !hint.trim().is_empty() {
+        command.arg("--prompt").arg(hint);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

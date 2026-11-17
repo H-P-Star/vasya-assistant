@@ -23,6 +23,12 @@ pub trait Platform: Send + Sync + 'static {
     fn media(&self, action: &str) -> Result<()>;
     fn volume(&self, value: Option<u8>, delta: f32) -> Result<()>;
     fn speak(&self, text: &str) -> Result<()>;
+    fn speak_configured(&self, text: &str, _: &Settings, _: &dyn Fn() -> bool) -> Result<()> {
+        self.speak(text)
+    }
+    fn stop_app(&self, _: &str) -> Result<()> {
+        bail!("Перезапуск клиента доступен в Windows")
+    }
     fn launch_app(&self, _: &str) -> Result<()> {
         bail!("Запуск приложений доступен только в Windows")
     }
@@ -35,6 +41,8 @@ pub struct Shared {
     pub busy: AtomicBool,
     pub dictating: AtomicBool,
     pub capture_open: AtomicBool,
+    pub calibrating: AtomicBool,
+    pub calibration_capture: AtomicBool,
     pub activate: AtomicBool,
     pub target: AtomicIsize,
     pub epoch: AtomicU64,
@@ -42,6 +50,7 @@ pub struct Shared {
     pub stop: AtomicBool,
     pub last_status: RwLock<String>,
     pub last_error: RwLock<Option<String>>,
+    pub last_result: RwLock<String>,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
     pub platform: Arc<dyn Platform>,
 }
@@ -54,6 +63,9 @@ impl Shared {
         }
         if kind == "error" {
             *self.last_error.write().unwrap() = Some(text.clone());
+        }
+        if kind == "result" {
+            *self.last_result.write().unwrap() = text.clone();
         }
         (self.sink)(Event {
             kind: kind.into(),
@@ -116,6 +128,8 @@ pub enum Task {
         dictating: bool,
     },
     Login,
+    TestVoice(Box<Settings>),
+    RestartMusic,
     Insert {
         text: String,
         target: isize,
@@ -151,6 +165,8 @@ impl Runtime {
             busy: AtomicBool::new(false),
             dictating: AtomicBool::new(false),
             capture_open: AtomicBool::new(false),
+            calibrating: AtomicBool::new(false),
+            calibration_capture: AtomicBool::new(false),
             activate: AtomicBool::new(false),
             target: AtomicIsize::new(0),
             epoch: AtomicU64::new(0),
@@ -160,6 +176,7 @@ impl Runtime {
             platform,
             last_status: RwLock::new("Запускаю помощника".into()),
             last_error: RwLock::new(None),
+            last_result: RwLock::new(String::new()),
         });
         let (sender, receiver) = mpsc::sync_channel(4);
         let browser_process = Arc::new(Mutex::new(browser::BrowserProcess::default()));
@@ -182,11 +199,14 @@ impl Runtime {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
+                    let confirmation_epoch = state.epoch.load(SeqCst);
                     match execute(&state, &mut music, task) {
                         Ok(message) => {
                             state.emit("info", &message);
                             if state.snapshot().voice_feedback
-                                && message != "Ответ готов в окне помощника"
+                                && message != "Ответ сохранён"
+                                && message != "Проверка голоса завершена"
+                                && !state.cancelled(confirmation_epoch)
                                 && !state.stop.load(SeqCst)
                                 && !(state.dictating.load(SeqCst) && message == "Текст вставлен")
                                 && !state.capture_open.load(SeqCst)
@@ -197,7 +217,11 @@ impl Runtime {
                                 } else {
                                     &message
                                 };
-                                if let Err(error) = state.platform.speak(brief) {
+                                if let Err(error) = state.platform.speak_configured(
+                                    brief,
+                                    &state.snapshot(),
+                                    &|| state.cancelled(confirmation_epoch),
+                                ) {
                                     state.emit(
                                         "error",
                                         format!("Голосовое подтверждение недоступно: {error:#}"),
@@ -280,8 +304,30 @@ fn insert_if_current(
 }
 
 fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Result<String> {
-    let settings = state.snapshot();
+    let settings =
+        crate::config::resolve_speech(&state.snapshot(), &state.resources.read().unwrap());
     let (text, target, epoch, preview, dictating) = match task {
+        Task::RestartMusic => {
+            let settings = Settings {
+                music_service: "yandex".into(),
+                music_mode: "desktop".into(),
+                ..settings
+            };
+            let exe = browser::native_executable(&settings)?
+                .ok_or_else(|| anyhow::anyhow!("Не найдено приложение Яндекс Музыки"))?;
+            state.platform.stop_app(&exe.to_string_lossy())?;
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            return music.login(&settings);
+        }
+        Task::TestVoice(settings) => {
+            let epoch = state.epoch.load(SeqCst);
+            state.platform.speak_configured(
+                "Привет! Я Вася. Так звучит выбранный голос.",
+                &settings,
+                &|| state.cancelled(epoch),
+            )?;
+            return Ok("Проверка голоса завершена".into());
+        }
         Task::Login => return music.login(&settings),
         Task::Insert {
             text,
@@ -303,17 +349,20 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
             if state.cancelled(epoch) {
                 bail!("Команда отменена");
             }
-            if let Some(samples) = samples {
-                let refined = crate::speech::whisper(
-                    std::path::Path::new(&settings.whisper_executable),
-                    std::path::Path::new(&settings.whisper_model),
-                    &samples,
-                    || state.cancelled(epoch),
-                )?;
+            if let Some(samples) = samples.filter(|_| {
+                !commands::time_sensitive(&commands::parse_with_settings(
+                    &text, dictating, &settings,
+                ))
+            }) {
+                let refined = crate::speech::whisper_configured(&settings, &samples, || {
+                    state.cancelled(epoch)
+                })?;
                 text = if had_wake {
-                    crate::activation::strip_wake(&refined, &settings.wake_words)
-                        .unwrap_or(&refined)
-                        .to_string()
+                    crate::activation::detected_body(
+                        &refined,
+                        &crate::activation::all_wake_words(&settings),
+                    )
+                    .to_string()
                 } else {
                     refined
                 };
@@ -324,9 +373,10 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
     if state.cancelled(epoch) {
         bail!("Команда отменена");
     }
+    let text = crate::calibration::correct(&text, &settings.speech_corrections);
     state.emit("heard", &text);
     state.emit("status", "Выполняю команду");
-    let mut command = commands::parse(&text, dictating, &settings.aliases);
+    let mut command = commands::parse_with_settings(&text, dictating, &settings);
     if matches!(command, Command::Unknown(_)) && settings.llm_fallback {
         state.emit("status", "Обращаюсь к модели…");
         command = crate::generator::resolve(&settings, &text, || state.cancelled(epoch))?;
@@ -338,7 +388,7 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
     match command {
         Command::Search(query) => { browser::open_external(&browser::search_url(&query))?; Ok("Открыт поиск в браузере".into()) }
         Command::Youtube(query) => browser::youtube(&query),
-        Command::Music { query, category } => music.play(&settings, &query, &category),
+        Command::Music { query, category } => music.play_with_cancel(&settings, &query, &category,&||state.cancelled(epoch)),
         Command::OpenMusic(service) => music.login(&Settings { music_service: service, ..settings }),
         Command::Generate(prompt) => {
             let output = crate::generator::generate_with_cancel(&settings, &prompt, || state.cancelled(epoch))?;
@@ -373,9 +423,9 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
             state.emit("answer", &answer);
             if settings.voice_feedback && !state.capture_open.load(SeqCst) && !state.cancelled(epoch) {
                 let brief: String = answer.chars().take(1200).collect();
-                state.platform.speak(&brief)?;
+                state.platform.speak_configured(&brief, &settings, &|| state.cancelled(epoch))?;
             }
-            Ok("Ответ готов в окне помощника".into())
+            Ok("Ответ сохранён".into())
         }
         Command::LaunchApp(path) => { state.platform.launch_app(&path)?; Ok("Приложение открыто".into()) }
         Command::Disabled => Ok("Эта команда отключена в настройках".into()),
@@ -545,6 +595,23 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("Громкость"));
+        runtime.close();
+    }
+    #[test]
+    fn simple_media_commands_skip_whisper_and_keep_their_immediate_action() {
+        let platform = Arc::new(Fake::default());
+        let runtime = Runtime::start(Settings::default(), platform.clone(), Arc::new(|_| {}));
+        let task = Task::Text {
+            text: "пауза".into(),
+            target: 1,
+            epoch: 0,
+            preview: false,
+            samples: Some(vec![0; 1600]),
+            had_wake: false,
+            dictating: false,
+        };
+        execute(&runtime.shared, &mut UnusedMusic, task).unwrap();
+        assert_eq!(*platform.media_actions.lock().unwrap(), vec!["pause"]);
         runtime.close();
     }
     #[test]

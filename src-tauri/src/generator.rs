@@ -36,8 +36,42 @@ fn request(
     json_mode: bool,
     cancelled: impl Fn() -> bool,
 ) -> Result<String> {
+    let key = crate::credentials::load(settings.llm_provider.credential_id())?;
+    request_with_key(
+        settings,
+        prompt,
+        system,
+        json_mode,
+        cancelled,
+        key.as_deref(),
+    )
+}
+
+fn endpoint(settings: &Settings, suffix: &str) -> String {
+    let base = settings.llm_url.trim_end_matches('/');
+    if base.ends_with("/v1") && suffix.starts_with("/v1/") {
+        format!("{base}{}", &suffix[3..])
+    } else {
+        format!("{base}{suffix}")
+    }
+}
+
+fn request_with_key(
+    settings: &Settings,
+    prompt: &str,
+    system: &str,
+    json_mode: bool,
+    cancelled: impl Fn() -> bool,
+    key: Option<&str>,
+) -> Result<String> {
+    if settings.llm_provider.cloud() && key.is_none_or(str::is_empty) {
+        bail!("Сохраните API-ключ выбранного облачного провайдера в настройках");
+    }
     let (path, mut body) = match settings.llm_provider {
-        LlmProvider::LmStudio => (
+        LlmProvider::LmStudio
+        | LlmProvider::OpenRouter
+        | LlmProvider::OpenAi
+        | LlmProvider::Compatible => (
             "/v1/chat/completions",
             json!({
                 "model": settings.llm_model, "stream": false, "max_tokens": 1024,
@@ -52,23 +86,33 @@ fn request(
             }),
         ),
     };
-    if json_mode {
+    if settings.llm_provider == LlmProvider::OpenAi {
+        body.as_object_mut().unwrap().remove("max_tokens");
+        body["max_completion_tokens"] = json!(1600);
+    }
+    if json_mode && settings.llm_structured {
         match settings.llm_provider {
-            LlmProvider::LmStudio => {
+            LlmProvider::LmStudio
+            | LlmProvider::OpenRouter
+            | LlmProvider::OpenAi
+            | LlmProvider::Compatible => {
                 body["response_format"] = json!({"type":"json_schema", "json_schema": {
                     "name":"vasya_intent", "strict":true, "schema": {
-                        "type":"object", "additionalProperties":false, "required":["action"],
+                        "type":"object", "additionalProperties":false, "required":["action","query","artist","text","category","value"],
                         "properties": {
                             "action":{"type":"string","enum":["music","search","youtube","pause","resume","next","volume_up","volume_down","volume","dictation_start","dictation_stop","mute","insert","answer"]},
-                            "query":{"type":"string"}, "text":{"type":"string"},
-                            "category":{"type":"string","enum":["track","artist","playlist"]},
-                            "value":{"type":"integer","minimum":0,"maximum":100}
+                            "artist":{"type":["string","null"]}, "query":{"type":["string","null"]}, "text":{"type":["string","null"]},
+                            "category":{"type":["string","null"],"enum":["track","artist","playlist",null]},
+                            "value":{"type":["integer","null"],"minimum":0,"maximum":100}
                         }
                     }
                 }})
             }
             LlmProvider::Ollama => body["format"] = json!("json"),
         }
+    }
+    if json_mode && settings.llm_structured && settings.llm_provider == LlmProvider::OpenRouter {
+        body["provider"] = json!({"require_parameters":true});
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -81,17 +125,18 @@ fn request(
             .build()?;
         let mut request = Box::pin(async {
             Ok::<Value, anyhow::Error>(
-                client
-                    .post(format!("{}{path}", settings.llm_url.trim_end_matches('/')))
-                    .json(&body)
-                    .send()
+                {
+                    let mut request = client.post(endpoint(settings,path)).json(&body);
+                    if let Some(key) = key { request = request.bearer_auth(key); }
+                    request.send()
+                }
                     .await
                     .context(
-                        "Сервер генерации недоступен. Проверьте запуск LM Studio/Ollama и адрес",
+                        "Сервер модели недоступен. Проверьте подключение и базовый адрес API",
                     )?
                     .error_for_status()
                     .context(
-                        "Сервер отклонил запрос. Проверьте провайдер и имя загруженной модели",
+                        "Сервер отклонил запрос. Проверьте API-ключ, баланс, модель и поддержку структурированных ответов",
                     )?
                     .json()
                     .await?,
@@ -108,7 +153,10 @@ fn request(
         }
     })?;
     let text = match settings.llm_provider {
-        LlmProvider::LmStudio => response["choices"][0]["message"]["content"].as_str(),
+        LlmProvider::LmStudio
+        | LlmProvider::OpenRouter
+        | LlmProvider::OpenAi
+        | LlmProvider::Compatible => response["choices"][0]["message"]["content"].as_str(),
         LlmProvider::Ollama => response["response"].as_str(),
     }
     .unwrap_or_default()
@@ -126,7 +174,8 @@ pub fn resolve(
 ) -> Result<crate::commands::Command> {
     let system = r#"Ты голосовой помощник Вася. Определи намерение пользователя и верни ТОЛЬКО JSON.
 Разрешены следующие формы:
-{"action":"music","query":"название","category":"track"} category: track/artist/playlist.
+{"action":"music","query":"название","artist":"исполнитель или null","category":"track"} category: track/artist/playlist.
+Для «включи трек Перемен исполнителя Кино» query=Перемен, artist=Кино. Слова «трек» и «исполнителя» не входят в название.
 {"action":"search","query":"запрос"}, {"action":"youtube","query":"запрос"}.
 {"action":"pause"}, {"action":"resume"}, {"action":"next"},
 {"action":"volume_up"}, {"action":"volume_down"}, {"action":"volume","value":35},
@@ -161,15 +210,26 @@ fn parse_resolution(text: &str) -> Result<crate::commands::Command> {
         Ok(value.into())
     };
     Ok(match plan["action"].as_str() {
-        Some("music") => Command::Music {
-            query: field("query")?,
-            category: match plan["category"].as_str().unwrap_or("track") {
+        Some("music") => {
+            let category = match plan["category"].as_str().unwrap_or("track") {
                 "track" => Category::Track,
                 "artist" => Category::Artist,
                 "playlist" => Category::Playlist,
                 _ => bail!("LLM вернула неизвестную категорию музыки"),
-            },
-        },
+            };
+            let query = field("query")?;
+            let query = if category == Category::Track
+                && plan["artist"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty())
+            {
+                let title = crate::browser::MusicQuery::parse(&query, &category).title;
+                format!("{title} исполнителя {}", field("artist")?)
+            } else {
+                query
+            };
+            Command::Music { query, category }
+        }
         Some("search") => Command::Search(field("query")?),
         Some("youtube") => Command::Youtube(field("query")?),
         Some("pause") => Command::Pause,
@@ -194,17 +254,26 @@ fn parse_resolution(text: &str) -> Result<crate::commands::Command> {
 
 pub fn models(settings: &Settings) -> Result<Vec<String>> {
     let path = match settings.llm_provider {
-        LlmProvider::LmStudio => "/v1/models",
+        LlmProvider::LmStudio
+        | LlmProvider::OpenRouter
+        | LlmProvider::OpenAi
+        | LlmProvider::Compatible => "/v1/models",
         LlmProvider::Ollama => "/api/tags",
     };
-    let response: Value = client(10)?
-        .get(format!("{}{path}", settings.llm_url.trim_end_matches('/')))
+    let mut request = client(10)?.get(endpoint(settings, path));
+    if let Some(key) = crate::credentials::load(settings.llm_provider.credential_id())? {
+        request = request.bearer_auth(key);
+    }
+    let response: Value = request
         .send()
         .context("Не удалось подключиться к серверу генерации")?
         .error_for_status()?
         .json()?;
     let (key, field) = match settings.llm_provider {
-        LlmProvider::LmStudio => ("data", "id"),
+        LlmProvider::LmStudio
+        | LlmProvider::OpenRouter
+        | LlmProvider::OpenAi
+        | LlmProvider::Compatible => ("data", "id"),
         LlmProvider::Ollama => ("models", "name"),
     };
     Ok(response[key]
@@ -275,6 +344,7 @@ mod tests {
         let address = server.local_addr().unwrap();
         let response = response.to_owned();
         let path = path.to_owned();
+        let cloud = provider.cloud();
         let thread = std::thread::spawn(move || {
             let (mut stream, _) = server.accept().unwrap();
             stream
@@ -303,6 +373,11 @@ mod tests {
             }
             let request = String::from_utf8(bytes).unwrap();
             assert!(request.starts_with(&format!("POST {path}")));
+            if cloud {
+                assert!(request
+                    .to_lowercase()
+                    .contains("authorization: bearer unit-test-key"));
+            }
             let body: Value =
                 serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
             assert_eq!(body["stream"], false);
@@ -311,11 +386,18 @@ mod tests {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
         });
         let settings = Settings {
-            llm_url: format!("http://{address}"),
+            llm_url: format!("http://{address}{}", if cloud { "/api/v1" } else { "" }),
             llm_provider: provider,
             ..Settings::default()
         };
-        let result = request(&settings, "что такое IPv6", "system", json_mode, || false);
+        let result = request_with_key(
+            &settings,
+            "что такое IPv6",
+            "system",
+            json_mode,
+            || false,
+            if cloud { Some("unit-test-key") } else { None },
+        );
         thread.join().unwrap();
         result
     }
@@ -349,6 +431,46 @@ mod tests {
             true,
         )
         .unwrap();
+    }
+    #[test]
+    fn cloud_requests_use_bearer_auth_and_do_not_duplicate_v1() {
+        let response = r#"{"choices":[{"message":{"content":"Ответ"}}]}"#;
+        exercise_request(
+            LlmProvider::OpenRouter,
+            response,
+            "/api/v1/chat/completions",
+            |body| {
+                assert_eq!(body["provider"]["require_parameters"], true);
+                assert_eq!(
+                    body["response_format"]["json_schema"]["schema"]["required"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    6
+                );
+            },
+            true,
+        )
+        .unwrap();
+        exercise_request(
+            LlmProvider::OpenAi,
+            response,
+            "/api/v1/chat/completions",
+            |body| {
+                assert_eq!(body["max_completion_tokens"], 1600);
+                assert!(body.get("max_tokens").is_none());
+            },
+            true,
+        )
+        .unwrap();
+        let settings = Settings {
+            llm_provider: LlmProvider::Compatible,
+            ..Settings::default()
+        };
+        assert!(request_with_key(&settings, "x", "x", false, || false, None)
+            .unwrap_err()
+            .to_string()
+            .contains("API-ключ"));
     }
     #[test]
     fn lm_studio_uses_chat_completions() {

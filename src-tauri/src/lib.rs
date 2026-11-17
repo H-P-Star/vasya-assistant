@@ -1,10 +1,13 @@
 pub mod activation;
 pub mod browser;
+pub mod calibration;
 pub mod commands;
 pub mod config;
+pub mod credentials;
 pub mod generator;
 pub mod runtime;
 pub mod speech;
+pub mod voice;
 
 #[cfg(windows)]
 pub mod audio;

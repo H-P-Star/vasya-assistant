@@ -23,6 +23,173 @@ pub fn devices() -> Result<Vec<String>> {
         .collect())
 }
 
+fn capture(name: &str, seconds: u64, cancelled: impl Fn() -> bool) -> Result<Vec<i16>> {
+    let host = cpal::default_host();
+    let device = if name.is_empty() {
+        host.default_input_device()
+    } else {
+        host.input_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(name))
+    }
+    .context("Микрофон калибровки не найден")?;
+    let supported = device.default_input_config()?;
+    let config: cpal::StreamConfig = supported.clone().into();
+    let (tx, rx) = mpsc::sync_channel(96);
+    let failed = Arc::new(std::sync::Mutex::new(None));
+    fn build<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        tx: SyncSender<Vec<i16>>,
+        failed: Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Result<cpal::Stream>
+    where
+        T: cpal::SizedSample,
+        f32: cpal::FromSample<T>,
+    {
+        let channels = config.channels as usize;
+        let mut resampler = Resampler::new(config.sample_rate.0);
+        let overrun = failed.clone();
+        Ok(device.build_input_stream(
+            config,
+            move |data: &[T], _| {
+                let mono: Vec<_> = data
+                    .chunks_exact(channels)
+                    .map(|f| f.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32)
+                    .collect();
+                if tx.try_send(resampler.push(&mono)).is_err() {
+                    *overrun.lock().unwrap() =
+                        Some("Пропущен фрагмент записи. Повторите шаг калибровки.".into());
+                }
+            },
+            move |e| *failed.lock().unwrap() = Some(format!("Ошибка микрофона: {e}")),
+            None,
+        )?)
+    }
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => build::<f32>(&device, &config, tx, failed.clone())?,
+        cpal::SampleFormat::I16 => build::<i16>(&device, &config, tx, failed.clone())?,
+        cpal::SampleFormat::U16 => build::<u16>(&device, &config, tx, failed.clone())?,
+        _ => bail!("Неподдерживаемый формат микрофона"),
+    };
+    stream.play()?;
+    let start = Instant::now();
+    let mut result = Vec::new();
+    while start.elapsed() < Duration::from_secs(seconds) {
+        if cancelled() {
+            bail!("Калибровка отменена");
+        }
+        if let Ok(samples) = rx.recv_timeout(Duration::from_millis(50)) {
+            result.extend(samples);
+        }
+    }
+    drop(stream);
+    if let Some(error) = failed.lock().unwrap().take() {
+        bail!("{error}");
+    }
+    if result.is_empty() {
+        bail!("Микрофон не передал звук");
+    }
+    Ok(result)
+}
+
+pub fn calibrate(
+    state: Arc<Shared>,
+    settings: Settings,
+    expected: String,
+    seconds: u64,
+) -> Result<crate::calibration::Report> {
+    settings.validate()?;
+    if !(2..=8).contains(&seconds) || expected.chars().count() > 200 {
+        bail!("Шаг калибровки: 2–8 секунд, фраза до 200 символов");
+    }
+    if state
+        .busy
+        .compare_exchange(false, true, SeqCst, SeqCst)
+        .is_err()
+    {
+        bail!("Дождитесь завершения текущей команды");
+    }
+    struct Guard(Arc<Shared>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.calibration_capture.store(false, SeqCst);
+            self.0.calibrating.store(false, SeqCst);
+            self.0.busy.store(false, SeqCst);
+        }
+    }
+    let _guard = Guard(state.clone());
+    state.calibrating.store(true, SeqCst);
+    state.epoch.fetch_add(1, SeqCst);
+    state.activate.store(false, SeqCst);
+    state.dictating.store(false, SeqCst);
+    let epoch = state.epoch.load(SeqCst);
+    for _ in 0..100 {
+        if !state.capture_open.load(SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if state.capture_open.load(SeqCst) {
+        bail!("Фоновый микрофон не освободился. Повторите калибровку.");
+    }
+    state.calibration_capture.store(true, SeqCst);
+    let samples = capture(&settings.microphone, seconds, || state.cancelled(epoch))?;
+    state.calibration_capture.store(false, SeqCst);
+    if expected.is_empty() {
+        return Ok(crate::calibration::analyze(
+            &samples,
+            &expected,
+            String::new(),
+            String::new(),
+        ));
+    }
+    let resolved = crate::config::resolve_speech(&settings, &state.resources.read().unwrap());
+    let scaled: Vec<_> = samples
+        .iter()
+        .map(|s| (*s as f32 * settings.speech_gain).clamp(-32768.0, 32767.0) as i16)
+        .collect();
+    let mut vosk = Vosk::load(
+        Path::new(&resolved.vosk_library),
+        Path::new(&resolved.vosk_model),
+        16000.0,
+    )?;
+    let words = crate::activation::all_wake_words(&settings);
+    let is_wake = words
+        .iter()
+        .any(|w| crate::commands::normalize(w) == crate::commands::normalize(&expected));
+    if is_wake {
+        vosk.configure_wake(&words, Path::new(&resolved.vosk_model))?;
+    }
+    let mut transcripts = Vec::new();
+    let mut detected = false;
+    for chunk in scaled.chunks(1600) {
+        if state.cancelled(epoch) {
+            bail!("Калибровка отменена");
+        }
+        if is_wake {
+            detected |= strip_wake(&vosk.wake(chunk)?, &words).is_some();
+        }
+        if let Some(text) = vosk.accept(chunk)? {
+            transcripts.push(text);
+        }
+    }
+    transcripts.push(vosk.finish()?);
+    let text = transcripts.join(" ").trim().to_string();
+    let refined = if !is_wake && settings.speech_mode == SpeechMode::Whisper {
+        crate::speech::whisper_configured(&resolved, &scaled, || state.cancelled(epoch))?
+    } else {
+        String::new()
+    };
+    let mut report = crate::calibration::analyze(&samples, &expected, text, refined);
+    report.wake_detected = detected;
+    if is_wake && detected {
+        report.matches = true;
+        report.wake_candidate = None;
+        report.message="Обращение распознано отдельным детектором. Общий текст Vosk может отличаться — вариант вызова уже работает.".into();
+    }
+    Ok(report)
+}
+
 /// Short, explicit microphone check; no recognizer or command execution runs here.
 pub fn measure_input(name: &str) -> Result<f32> {
     use std::sync::atomic::AtomicU32;
@@ -137,6 +304,7 @@ fn stream(settings: &Settings, state: Arc<Shared>) -> Result<(cpal::Stream, Rece
         config: &cpal::StreamConfig,
         channels: usize,
         rate: u32,
+        gain: f32,
         tx: SyncSender<Vec<i16>>,
         state: Arc<Shared>,
     ) -> Result<cpal::Stream>
@@ -156,7 +324,9 @@ fn stream(settings: &Settings, state: Arc<Shared>) -> Result<(cpal::Stream, Rece
                 let mono: Vec<f32> = data
                     .chunks_exact(channels)
                     .map(|frame| {
-                        frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
+                        (frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
+                            * gain)
+                            .clamp(-1.0, 1.0)
                     })
                     .collect();
                 if level_time.elapsed() > Duration::from_millis(100) {
@@ -182,9 +352,33 @@ fn stream(settings: &Settings, state: Arc<Shared>) -> Result<(cpal::Stream, Rece
         )?)
     }
     let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, &config, channels, rate, tx, state)?,
-        cpal::SampleFormat::I16 => build::<i16>(&device, &config, channels, rate, tx, state)?,
-        cpal::SampleFormat::U16 => build::<u16>(&device, &config, channels, rate, tx, state)?,
+        cpal::SampleFormat::F32 => build::<f32>(
+            &device,
+            &config,
+            channels,
+            rate,
+            settings.speech_gain,
+            tx,
+            state,
+        )?,
+        cpal::SampleFormat::I16 => build::<i16>(
+            &device,
+            &config,
+            channels,
+            rate,
+            settings.speech_gain,
+            tx,
+            state,
+        )?,
+        cpal::SampleFormat::U16 => build::<u16>(
+            &device,
+            &config,
+            channels,
+            rate,
+            settings.speech_gain,
+            tx,
+            state,
+        )?,
         other => bail!("Неподдерживаемый формат микрофона: {other}"),
     };
     stream.play()?;
@@ -222,9 +416,11 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
         Path::new(&settings.vosk_model),
         16000.0,
     )?;
+    let wake_words = crate::activation::all_wake_words(&settings);
+    vosk.configure_wake(&wake_words, Path::new(&settings.vosk_model))?;
     let mut gate = Gate::new(
         settings.activation.clone(),
-        settings.wake_words.clone(),
+        crate::activation::all_wake_words(&settings),
         settings.command_timeout,
     );
     let mut input = None;
@@ -232,6 +428,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
     let mut epoch = state.epoch.load(SeqCst);
     let mut status = String::new();
     let mut wake_previewed = false;
+    let mut wake_detected = false;
     let mut partial_at = Instant::now();
     while !state.stop.load(SeqCst) && state.config_version.load(SeqCst) == version {
         let now = Instant::now();
@@ -241,6 +438,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             vosk.reset();
             utterance.clear();
             wake_previewed = false;
+            wake_detected = false;
             input = None;
             state.capture_open.store(false, SeqCst);
         }
@@ -250,6 +448,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             state.capture_open.store(false, SeqCst);
             gate.arm(now);
             wake_previewed = false;
+            wake_detected = false;
             vosk.reset();
             utterance.clear();
         }
@@ -282,6 +481,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             vosk.reset();
             utterance.clear();
             wake_previewed = false;
+            wake_detected = false;
             if muted || busy {
                 gate.reset();
             }
@@ -303,9 +503,24 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             continue;
         }
         utterance.extend_from_slice(&samples);
+        let rms = (samples
+            .iter()
+            .map(|s| (*s as f32 / 32768.0).powi(2))
+            .sum::<f32>()
+            / samples.len().max(1) as f32)
+            .sqrt();
+        if !gate.armed(now)
+            && !dictating
+            && !wake_previewed
+            && rms < settings.noise_floor
+            && utterance.len() > 32000
+        {
+            utterance.drain(..utterance.len() - 16000);
+        }
         if utterance.len() > 16000 * 30 {
             utterance.clear();
             wake_previewed = false;
+            wake_detected = false;
             vosk.reset();
             gate.reset();
             state.emit(
@@ -314,8 +529,26 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             );
             continue;
         }
+        if !dictating && settings.activation != Activation::Hotkey {
+            let hypothesis = vosk.wake(&samples)?;
+            if strip_wake(&hypothesis, &wake_words).is_some() {
+                wake_detected = true;
+                gate.arm(Instant::now());
+                if !wake_previewed {
+                    state.target.store(state.platform.foreground(), SeqCst);
+                    state.emit("activated", "Слушаю команду…");
+                }
+                wake_previewed = true;
+            }
+        }
         if let Some(text) = vosk.accept(&samples)? {
-            let had_wake = !dictating && strip_wake(&text, &settings.wake_words).is_some();
+            let had_wake =
+                !dictating && (wake_detected || strip_wake(&text, &wake_words).is_some());
+            let text = if wake_detected {
+                crate::activation::after_detected_wake(&text, &settings)
+            } else {
+                text
+            };
             match gate.accept(&text, dictating, Instant::now()) {
                 Accepted::Wake => {
                     if !wake_previewed {
@@ -362,7 +595,9 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
                 }
             }
             utterance.clear();
+            vosk.reset_wake();
             wake_previewed = false;
+            wake_detected = false;
         } else if !wake_previewed
             && !dictating
             && !gate.armed(Instant::now())
@@ -372,7 +607,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             partial_at = Instant::now();
             // A partial hypothesis may show the UI, but only the final transcript
             // can arm the gate or execute a command.
-            if strip_wake(&vosk.partial()?, &settings.wake_words).is_some() {
+            if strip_wake(&vosk.partial()?, &wake_words).is_some() {
                 wake_previewed = true;
                 state.target.store(state.platform.foreground(), SeqCst);
                 state.emit("activated", "Слушаю команду…");

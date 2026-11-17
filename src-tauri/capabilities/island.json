@@ -1,7 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "island-events",
-  "description": "The local activation overlay only subscribes to assistant events",
-  "windows": ["island"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+  "description": "Local island can dismiss itself, resize its answer card, copy the current answer and open the main window",
+  "windows": [
+    "island"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-dismiss-island",
+    "allow-expand-island",
+    "allow-copy-result",
+    "allow-show-main"
+  ]
 }

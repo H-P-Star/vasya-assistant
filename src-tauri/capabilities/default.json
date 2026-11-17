@@ -17,6 +17,15 @@
     "allow-run-text",
     "allow-open-music-login",
     "allow-insert-result",
-    "allow-save-settings"
+    "allow-save-settings",
+    "allow-builtin-commands",
+    "allow-save-api-key",
+    "allow-list-voices",
+    "allow-calibrate-speech",
+    "allow-show-last-result",
+    "allow-test-voice",
+    "allow-restart-music-app",
+    "allow-cancel-current",
+    "allow-open-resource"
   ]
 }

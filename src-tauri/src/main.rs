@@ -20,6 +20,9 @@ fn main() {
                 16000.0,
             )?;
             vosk.accept(&vec![0i16; 16000])?;
+            // Exercise the installed multilingual decoder, including its model and
+            // CRT dependencies, rather than merely checking that the file exists.
+            vasya::speech::whisper_configured(&settings, &vec![0i16; 16000], || false)?;
             Ok(())
         })();
         let report = serde_json::json!({"ok":result.is_ok(), "error":result.as_ref().err().map(|e| format!("{e:#}"))});

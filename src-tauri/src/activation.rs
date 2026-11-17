@@ -1,6 +1,52 @@
 use crate::config::Activation;
 use std::time::{Duration, Instant};
 
+pub fn all_wake_words(settings: &crate::config::Settings) -> Vec<String> {
+    settings
+        .wake_words
+        .iter()
+        .chain(&settings.wake_aliases)
+        .map(|w| w.trim().to_lowercase())
+        .collect()
+}
+
+/// Only strip the common shortened transcription after the dedicated wake detector fired.
+pub fn detected_body<'a>(text: &'a str, words: &[String]) -> &'a str {
+    if let Some(body) = strip_wake(text, words) {
+        return body;
+    }
+    if let Some(body) = strip_wake(
+        text,
+        &[
+            "вас".into(),
+            "ваша".into(),
+            "ваш".into(),
+            "vasya".into(),
+            "vasia".into(),
+            "vassia".into(),
+        ],
+    ) {
+        return body;
+    }
+    text
+}
+
+pub fn after_detected_wake(text: &str, settings: &crate::config::Settings) -> String {
+    let words = all_wake_words(settings);
+    let body = detected_body(text, &words);
+    let wake_only = text.split_whitespace().count() <= 1
+        && matches!(
+            crate::commands::parse_with_settings(body, false, settings),
+            crate::commands::Command::Unknown(_)
+        );
+    let word = words.first().map(String::as_str).unwrap_or("вася");
+    if body.is_empty() || wake_only {
+        word.into()
+    } else {
+        format!("{word} {body}")
+    }
+}
+
 pub fn strip_wake<'a>(text: &'a str, words: &[String]) -> Option<&'a str> {
     let text = text.trim();
     let lower = text.to_lowercase();
@@ -89,6 +135,42 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn personal_wake_aliases_keep_word_boundaries() {
+        let settings = crate::config::Settings {
+            wake_aliases: vec!["вас".into()],
+            ..Default::default()
+        };
+        let words = all_wake_words(&settings);
+        assert_eq!(
+            strip_wake("вас включи музыку", &words),
+            Some("включи музыку")
+        );
+        assert_eq!(strip_wake("васян включи музыку", &words), None);
+        assert_eq!(detected_body("Vasya, play Numb", &words), "play Numb");
+    }
+    #[test]
+    fn a_confirmed_short_wake_is_not_sent_as_an_unknown_llm_request() {
+        let settings = crate::config::Settings::default();
+        let words = all_wake_words(&settings);
+        for text in ["базе", "вас", "ваша"] {
+            assert_eq!(
+                strip_wake(&after_detected_wake(text, &settings), &words),
+                Some("")
+            );
+        }
+        assert_eq!(
+            strip_wake(&after_detected_wake("пауза", &settings), &words),
+            Some("пауза")
+        );
+        assert_eq!(
+            strip_wake(
+                &after_detected_wake("ваша включи трек Numb", &settings),
+                &words
+            ),
+            Some("включи трек Numb")
+        );
+    }
     fn gate(mode: Activation) -> Gate {
         Gate::new(mode, vec!["вась".into(), "вася".into()], 10)
     }

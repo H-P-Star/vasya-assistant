@@ -29,6 +29,8 @@ struct Bootstrap {
     errors: Vec<String>,
     status: String,
     last_error: Option<String>,
+    last_result: String,
+    llm_key_set: bool,
 }
 
 #[tauri::command]
@@ -43,15 +45,23 @@ fn get_state(runtime: State<'_, Runtime>, errors: State<'_, StartupErrors>) -> B
                 && std::path::Path::new(&s.vosk_model)
                     .join("am/final.mdl")
                     .is_file()
+                && (s.speech_mode == config::SpeechMode::Vosk
+                    || (std::path::Path::new(&s.whisper_executable).is_file()
+                        && std::path::Path::new(&s.whisper_model).is_file()))
         },
         settings: runtime.shared.snapshot(),
         muted: runtime.shared.muted.load(SeqCst),
         busy: runtime.shared.busy.load(SeqCst),
-        capture_open: runtime.shared.capture_open.load(SeqCst),
+        capture_open: runtime.shared.capture_open.load(SeqCst)
+            || runtime.shared.calibration_capture.load(SeqCst),
         data_directory: config::data_dir().to_string_lossy().into(),
         errors: errors.0.lock().unwrap().clone(),
         status: runtime.shared.last_status.read().unwrap().clone(),
         last_error: runtime.shared.last_error.read().unwrap().clone(),
+        last_result: runtime.shared.last_result.read().unwrap().clone(),
+        llm_key_set: crate::credentials::present(
+            runtime.shared.snapshot().llm_provider.credential_id(),
+        ),
     }
 }
 
@@ -71,6 +81,119 @@ async fn test_microphone(microphone: String) -> Result<f32, String> {
         .map_err(|e| {
             format!("{e:#}. Проверьте доступ к микрофону в параметрах конфиденциальности Windows.")
         })
+}
+
+#[tauri::command]
+fn builtin_commands() -> Vec<crate::commands::Builtin> {
+    crate::commands::builtin_catalog()
+}
+
+#[tauri::command]
+fn open_resource(kind: String) -> Result<(), String> {
+    let url = match kind.as_str() {
+        "piper" => "https://github.com/rhasspy/piper/releases/tag/2023.11.14-2",
+        "voices" => "https://huggingface.co/rhasspy/piper-voices/tree/v1.0.0/ru/ru_RU",
+        "open_router" => "https://openrouter.ai/keys",
+        "open_ai" => "https://platform.openai.com/api-keys",
+        "docs" => "https://github.com/H-P-Star/vasya-assistant#readme",
+        _ => return Err("Для этого сервиса используйте сайт его поставщика".into()),
+    };
+    crate::browser::open_external(url).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn save_api_key(provider: String, key: String) -> Result<(), String> {
+    crate::credentials::save(&provider, &key).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn list_voices() -> Result<Vec<crate::voice::Voice>, String> {
+    tauri::async_runtime::spawn_blocking(crate::platform::voices)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn calibrate_speech(
+    settings: Settings,
+    expected: String,
+    seconds: u64,
+    app: tauri::AppHandle,
+) -> Result<crate::calibration::Report, String> {
+    let state = app.state::<Runtime>().shared.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        audio::calibrate(state, settings, expected, seconds)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn dismiss_island(app: tauri::AppHandle) {
+    crate::island::dismiss(&app);
+}
+
+#[tauri::command]
+fn cancel_current(runtime: State<'_, Runtime>) {
+    runtime.shared.epoch.fetch_add(1, SeqCst);
+    runtime.shared.activate.store(false, SeqCst);
+    runtime.shared.dictating.store(false, SeqCst);
+    runtime.shared.emit("deactivated", "");
+}
+
+#[tauri::command]
+fn expand_island(expanded: bool, app: tauri::AppHandle) {
+    crate::island::expand(&app, expanded);
+}
+
+#[tauri::command]
+fn show_last_result(app: tauri::AppHandle, runtime: State<'_, Runtime>) -> Result<(), String> {
+    if !runtime.shared.snapshot().island_enabled {
+        return Err("Панель отключена в настройках".into());
+    }
+    let text = runtime.shared.last_result.read().unwrap().clone();
+    if text.is_empty() {
+        return Err("Пока нет сохранённого ответа".into());
+    }
+    runtime.shared.emit("activated", "Последний ответ");
+    runtime.shared.emit("preview_result", text);
+    crate::island::expand(&app, true);
+    Ok(())
+}
+
+#[tauri::command]
+fn show_main(app: tauri::AppHandle) {
+    crate::island::hide(&app);
+    show(&app);
+}
+
+#[tauri::command]
+fn copy_result(app: tauri::AppHandle, runtime: State<'_, Runtime>) -> Result<(), String> {
+    let owner = app
+        .get_webview_window("island")
+        .ok_or("Окно панели недоступно")?
+        .hwnd()
+        .map_err(|e| e.to_string())?
+        .0 as isize;
+    crate::platform::copy_text(&runtime.shared.last_result.read().unwrap(), owner)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn test_voice(settings: Settings, runtime: State<'_, Runtime>) -> Result<(), String> {
+    settings.validate().map_err(|e| e.to_string())?;
+    runtime
+        .submit(Task::TestVoice(Box::new(settings)))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn restart_music_app(runtime: State<'_, Runtime>) -> Result<(), String> {
+    runtime
+        .submit(Task::RestartMusic)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -247,6 +370,7 @@ fn save_settings(
 }
 
 fn show(app: &tauri::AppHandle) {
+    crate::island::hide(app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -282,8 +406,14 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
+                        if shortcut.to_string() == "Escape"
+                            && app.state::<crate::island::Island>().active.load(SeqCst)
+                        {
+                            crate::island::dismiss(app);
+                            return;
+                        }
                         if let Some(runtime) = app.try_state::<Runtime>() {
                             runtime.shared.activate();
                         }
@@ -393,7 +523,11 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "island" {
+                    crate::island::dismiss(window.app_handle());
+                } else {
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -407,7 +541,20 @@ pub fn run() {
             save_settings,
             check_llm,
             test_microphone,
-            finish_setup
+            finish_setup,
+            builtin_commands,
+            save_api_key,
+            list_voices,
+            calibrate_speech,
+            dismiss_island,
+            expand_island,
+            show_last_result,
+            show_main,
+            copy_result,
+            test_voice,
+            restart_music_app,
+            cancel_current,
+            open_resource
         ])
         .build(tauri::generate_context!())
         .expect("Не удалось запустить Васю")

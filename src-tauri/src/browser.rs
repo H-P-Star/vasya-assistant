@@ -1,5 +1,6 @@
 use crate::{commands::Category, config::Settings};
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     net::{TcpListener, TcpStream},
@@ -96,7 +97,252 @@ pub fn youtube(query: &str) -> Result<String> {
 
 pub trait MusicService {
     fn play(&mut self, settings: &Settings, query: &str, category: &Category) -> Result<String>;
+    fn play_with_cancel(
+        &mut self,
+        settings: &Settings,
+        query: &str,
+        category: &Category,
+        _: &dyn Fn() -> bool,
+    ) -> Result<String> {
+        self.play(settings, query, category)
+    }
 }
+
+#[derive(Debug)]
+pub struct MusicQuery {
+    pub title: String,
+    pub artist: String,
+    pub search: String,
+}
+impl MusicQuery {
+    pub fn parse(query: &str, category: &Category) -> Self {
+        let query = query.trim().trim_matches(['«', '»', '"']);
+        if *category == Category::Track {
+            for (pattern, min_words) in [
+                (
+                    r"(?i)^(.+?)\s+(?:исполнителя|исполнитель|группы|от)\s+(.+)$",
+                    1,
+                ),
+                (r"(?i)^(.+?)\s+by\s+(.+)$", 2),
+            ] {
+                let pattern = regex::Regex::new(pattern).unwrap();
+                if let Some(parts) = pattern.captures(query) {
+                    let title = parts[1].trim().trim_matches(['«', '»', '"']).to_string();
+                    let artist = parts[2].trim().trim_matches(['«', '»', '"']).to_string();
+                    if artist.split_whitespace().count() < min_words {
+                        continue;
+                    }
+                    return Self {
+                        search: format!("{title} {artist}"),
+                        title,
+                        artist,
+                    };
+                }
+            }
+        }
+        Self {
+            title: query.into(),
+            artist: String::new(),
+            search: query.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MusicCandidate {
+    id: String,
+    title: String,
+    artist: String,
+    kind: String,
+}
+
+fn comparable(text: &str) -> String {
+    crate::commands::normalize(text)
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+fn consonants(text: &str) -> String {
+    let mut text = comparable(text);
+    for (from, to) in [
+        ("shch", "щ"),
+        ("sch", "щ"),
+        ("sh", "ш"),
+        ("ch", "ч"),
+        ("th", "т"),
+        ("ph", "ф"),
+        ("ck", "к"),
+        ("qu", "к"),
+        ("ng", "нг"),
+    ] {
+        text = text.replace(from, to);
+    }
+    let mut result = String::new();
+    for c in text.chars() {
+        let c = match c {
+            'b' => 'б',
+            'c' | 'k' | 'q' => 'к',
+            'd' => 'д',
+            'f' => 'ф',
+            'g' => 'г',
+            'h' => 'х',
+            'j' => 'ж',
+            'l' => 'л',
+            'm' => 'м',
+            'n' => 'н',
+            'p' => 'п',
+            'r' => 'р',
+            's' => 'с',
+            't' => 'т',
+            'v' | 'w' => 'в',
+            'x' => 'к',
+            'z' => 'з',
+            c => c,
+        };
+        if !"aeiouyаеёиоуыэюяьъ".contains(c) && !result.ends_with(c) {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<_> = b.chars().collect();
+    let mut row: Vec<_> = (0..=b.len()).collect();
+    for (i, a) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, b) in b.iter().enumerate() {
+            let old = row[j + 1];
+            row[j + 1] = (row[j + 1] + 1)
+                .min(row[j] + 1)
+                .min(previous + usize::from(a != *b));
+            previous = old;
+        }
+    }
+    row[b.len()]
+}
+
+fn phonetic_match(a: &str, b: &str) -> bool {
+    let a = consonants(a);
+    let b = consonants(b);
+    let size = a.chars().count().max(b.chars().count());
+    if size > 80 {
+        return false;
+    }
+    a.chars().count() >= 2
+        && b.chars().count() >= 2
+        && distance(&a, &b) <= if size >= 8 { 2 } else { 1 }
+}
+fn select_candidate<'a>(
+    request: &MusicQuery,
+    category: &Category,
+    rows: &'a [MusicCandidate],
+) -> Option<&'a MusicCandidate> {
+    let kind = match category {
+        Category::Track => "track",
+        Category::Artist => "artist",
+        Category::Playlist => "playlist",
+    };
+    let title = comparable(&request.title);
+    let artist = comparable(&request.artist);
+    rows.iter()
+        .filter(|r| r.kind == kind && !r.title.is_empty())
+        .filter_map(|r| {
+            let actual_title = comparable(&r.title);
+            let actual_artist = comparable(&r.artist);
+            let artist_score = if artist.is_empty() {
+                0
+            } else if actual_artist.contains(&artist) {
+                30
+            } else if artist.chars().count().min(actual_artist.chars().count()) >= 6
+                && phonetic_match(&request.artist, &r.artist)
+            {
+                15
+            } else {
+                return None;
+            };
+            let title_score = if actual_title == title {
+                40
+            } else if actual_title.contains(&title) {
+                30
+            } else if !artist.is_empty()
+                && artist_score >= 15
+                && phonetic_match(&request.title, &r.title)
+            {
+                10
+            } else {
+                return None;
+            };
+            Some((title_score + artist_score, r))
+        })
+        .reduce(|best, next| if next.0 > best.0 { next } else { best })
+        .map(|(_, r)| r)
+}
+
+fn playback_matches(value: &Value, candidate: &MusicCandidate) -> bool {
+    if value["playing"] != true {
+        return false;
+    }
+    if candidate.kind == "artist" {
+        return value["selectedPlaying"] == candidate.id
+            && comparable(value["artist"].as_str().unwrap_or_default())
+                .contains(&comparable(&candidate.title));
+    }
+    if candidate.kind == "playlist" {
+        return value["selectedPlaying"] == candidate.id;
+    }
+    let title = comparable(value["title"].as_str().unwrap_or_default());
+    let artist = comparable(value["artist"].as_str().unwrap_or_default());
+    !title.is_empty()
+        && title == comparable(&candidate.title)
+        && (candidate.artist.is_empty() || artist.contains(&comparable(&candidate.artist)))
+}
+
+// Only fixed code is evaluated. Search text and selection IDs travel as CDP data arguments.
+const NATIVE_SNAPSHOT: &str = r#"(() => {
+ const rows=[]; const seen=new Set();
+ const groups={track:'[class*="CommonTrack_root"], [class*="Track_root"], [class*="HorizontalCardContainer_root"]:has(a[href*="/track/"])',artist:'[class*="ArtistCard_root"], [class*="HorizontalArtistCard_root"]',playlist:'[class*="PlaylistCard_root"], [class*="HorizontalPlaylistCard_root"]'};
+ for(const [kind,selector] of Object.entries(groups)) for(const root of document.querySelectorAll(selector)) {
+   const link=[...root.querySelectorAll(kind==='track'?'a[href*="/track/"]':kind==='artist'?'a[href*="/artist/"]':'a[href*="/playlists/"]')].find(a=>a.textContent.trim());
+   const title=link?.textContent?.trim(); if(!title) continue;
+   const artist=[...root.querySelectorAll('a[href*="/artist/"]')].map(a=>a.textContent.trim()).filter(Boolean).join(', ');
+   const key=kind+'|'+link.href+'|'+title; if(seen.has(key)) continue; seen.add(key);
+   if(!root.dataset.vasyaCandidate) root.dataset.vasyaCandidate='vasya-'+Math.random().toString(36).slice(2);
+   root.dataset.vasyaKind=kind;
+   rows.push({id:root.dataset.vasyaCandidate,title,artist,kind});
+ }
+ const meta=navigator.mediaSession?.metadata;
+ let playing=navigator.mediaSession?.playbackState==='playing'||[...document.querySelectorAll('audio,video')].some(m=>!m.paused&&m.currentTime>0);
+ const selected=[...document.querySelectorAll('[data-vasya-candidate]')].find(r=>r.querySelector('button[aria-label*="Приостанов"],button[aria-label*="Пауза"],button[aria-label*="Pause"],button[class*="playing"],button[class*="Playing"]'));
+ playing=playing||!!selected;
+ return {rows,playback:{playing,title:meta?.title||'',artist:meta?.artist||'',selectedPlaying:selected?.dataset.vasyaCandidate||''}};
+})()"#;
+
+const NATIVE_CLICK: &str = r#"function(id,title,artist) {
+ let root=[...document.querySelectorAll('[data-vasya-candidate]')].find(r=>r.dataset.vasyaCandidate===id);
+ if(!root&&window.__vasyaSelection===id) {
+   root=document.querySelector('main header,[class*="PageHeader_root"],[class*="PageHeader_header"]');
+   if(root) root.dataset.vasyaCandidate=id;
+ }
+ if(!root) return false;
+ const norm=s=>s.toLowerCase().replace(/ё/g,'е').replace(/[^\p{L}\p{N}]/gu,'');
+ if(!norm(root.textContent||'').includes(norm(title)) || (artist&&!norm(root.textContent||'').includes(norm(artist)))) return false;
+ const buttons=[...root.querySelectorAll('button')];
+ const button=buttons.find(b=>/приостанов|пауза|pause/i.test(b.getAttribute('aria-label')||''))
+   ||buttons.find(b=>/воспроизвед|играть|слушать|play/i.test(b.getAttribute('aria-label')||b.title||'')||/playButton/i.test(b.className)||b.querySelector('use[href*="play"],use[xlink\\:href*="play"],svg[data-icon*="play"]'));
+ if(!button) {
+   if(root.dataset.vasyaKind!=='track') {
+     const link=[...root.querySelectorAll('a[href*="/artist/"],a[href*="/playlists/"]')].find(a=>a.textContent.trim());
+     if(link) { window.__vasyaSelection=id; link.click(); }
+   }
+   return false;
+ }
+ if(button.disabled) return false;
+ if(!/приостанов|пауза|pause/i.test(button.getAttribute('aria-label')||'')) button.click();
+ return true;
+}"#;
 
 #[derive(Default)]
 pub struct BrowserProcess {
@@ -153,7 +399,7 @@ impl BrowserMusic {
 
     pub fn login(&mut self, settings: &Settings) -> Result<String> {
         if settings.music_mode == "desktop" && settings.music_service != "youtube" {
-            self.play_native(settings, "", &Category::Track)?;
+            self.play_native(settings, "", &Category::Track, &|| false)?;
             return Ok("Музыкальное приложение открыто. Войдите в аккаунт, если требуется.".into());
         }
         self.native_chrome = None;
@@ -172,6 +418,18 @@ impl BrowserMusic {
 
 impl MusicService for BrowserMusic {
     fn play(&mut self, settings: &Settings, query: &str, category: &Category) -> Result<String> {
+        self.play_with_cancel(settings, query, category, &|| false)
+    }
+    fn play_with_cancel(
+        &mut self,
+        settings: &Settings,
+        query: &str,
+        category: &Category,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
+        if cancelled() {
+            bail!("Команда отменена");
+        }
         if settings.music_service == "youtube" {
             return youtube(&format!(
                 "{query} {}",
@@ -183,7 +441,7 @@ impl MusicService for BrowserMusic {
             ));
         }
         if settings.music_mode == "desktop" {
-            return self.play_native(settings, query, category);
+            return self.play_native(settings, query, category, cancelled);
         }
         self.native_chrome = None;
         let mut url = if settings.music_service == "spotify" {
@@ -220,6 +478,9 @@ impl MusicService for BrowserMusic {
         };
         let script = PLAY_SCRIPT.replace("__CATEGORY__", category);
         for _ in 0..8 {
+            if cancelled() {
+                bail!("Команда отменена");
+            }
             let result = chrome.evaluate(&script)?;
             if result.as_str() == Some("playing") {
                 return Ok(format!("Воспроизведение началось: {query}"));
@@ -253,7 +514,7 @@ pub fn native_music_uri(service: &str, query: &str, category: &Category) -> Stri
     format!("yandexmusic://search?{}", params.finish())
 }
 
-fn native_executable(settings: &Settings) -> Result<Option<PathBuf>> {
+pub(crate) fn native_executable(settings: &Settings) -> Result<Option<PathBuf>> {
     let (custom, candidates) = if settings.music_service == "spotify" {
         (
             &settings.spotify_app_path,
@@ -316,9 +577,11 @@ impl BrowserMusic {
         settings: &Settings,
         query: &str,
         category: &Category,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<String> {
         self.chrome = None;
-        let uri = native_music_uri(&settings.music_service, query, category);
+        let request = MusicQuery::parse(query, category);
+        let uri = native_music_uri(&settings.music_service, &request.search, category);
         let key = format!(
             "{}|{}|{}",
             settings.music_service, settings.yandex_app_path, settings.spotify_app_path
@@ -333,70 +596,106 @@ impl BrowserMusic {
         if settings.music_service == "spotify" {
             open_native(settings, &uri)?;
             return Ok(if query.is_empty() {
-                "Музыкальное приложение открыто".into()
+                "Spotify открыт".into()
             } else {
-                format!("Открыт поиск Spotify в приложении: {query}. Выберите результат и нажмите «Играть».")
+                format!(
+                    "Поиск Spotify открыт в приложении: {}. Выберите результат и нажмите «Играть».",
+                    request.search
+                )
             });
         }
-        if let Some(chrome) = self.native_chrome.as_mut() {
-            let _ =
-                chrome.evaluate("window.__vasyaClicked = false; window.__vasyaNavigated = false; window.__vasyaFiltered = false");
-            open_native(settings, &uri)?;
-        } else {
-            // Electron accepts a loopback CDP port only at its first launch. An already
-            // running client receives the deep link but may require manual playback.
-            if let Some(exe) = native_executable(settings)? {
-                match Chrome::launch_native(&exe, &uri, self.process.clone()) {
+        if self.native_chrome.is_none() {
+            let executable = native_executable(settings)?
+                .context("Укажите путь к приложению Яндекс Музыки в настройках")?;
+            self.native_chrome = Chrome::connect_saved(self.process.clone()).ok();
+            if self.native_chrome.is_none() {
+                match Chrome::launch_native(&executable, &uri, self.process.clone()) {
                     Ok(chrome) => self.native_chrome = Some(chrome),
-                    Err(_) => open_native(settings, &uri)?,
-                }
-                self.native_key = key;
-            } else {
-                open_native(settings, &uri)?;
-            }
-        }
-        if query.is_empty() {
-            return Ok("Музыкальное приложение открыто".into());
-        }
-        if let Some(chrome) = self.native_chrome.as_mut() {
-            // Deep links navigate asynchronously; do not click the previous search results.
-            let mut at_search = false;
-            let kind = match category {
-                Category::Track => "track",
-                Category::Artist => "artist",
-                Category::Playlist => "playlist",
-            };
-            let script = PLAY_SCRIPT.replace("__CATEGORY__", kind);
-            for _ in 0..12 {
-                if !at_search {
-                    at_search = chrome
-                        .evaluate("location.href")
-                        .ok()
-                        .and_then(|v| v.as_str().and_then(|s| url::Url::parse(s).ok()))
-                        .is_some_and(|url| {
-                            url.query_pairs().any(|(k, v)| k == "text" && v == query)
-                        });
-                    // Give the SPA a rendering turn after the deep link changes its URL.
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                if at_search {
-                    match chrome
-                        .evaluate(&script)
-                        .ok()
-                        .and_then(|v| v.as_str().map(String::from))
-                        .as_deref()
-                    {
-                        Some("playing") => {
-                            return Ok(format!("Воспроизведение в приложении началось: {query}"))
+                    Err(_) => {
+                        if query.is_empty() {
+                            open_native(settings, &uri)?;
+                            return Ok("Клиент открыт. Для управления нажмите «Подключить Яндекс Музыку» в настройках.".into());
                         }
-                        None => break,
-                        _ => {}
+                        bail!("Клиент Яндекс Музыки запущен без подключения к Васе. В настройках нажмите «Перезапустить и подключить» — это один раз перезапустит клиент и включит управление.");
                     }
                 }
-                std::thread::sleep(Duration::from_millis(500));
             }
+            self.native_key = key;
         }
-        Ok(format!("Открыт поиск Яндекс Музыки в приложении: {query}. Если музыка не началась, войдите в аккаунт и нажмите «Играть». Для автоматического запуска попробуйте закрыть клиент через его трей и повторить команду."))
+        let chrome = self.native_chrome.as_mut().unwrap();
+        if cancelled() {
+            bail!("Команда отменена");
+        }
+        if query.is_empty() {
+            chrome.call("Page.bringToFront", json!({}))?;
+            return Ok("Яндекс Музыка подключена".into());
+        }
+        let mut page = url::Url::parse(
+            chrome
+                .evaluate("location.href")?
+                .as_str()
+                .context("Нет адреса приложения")?,
+        )?;
+        if page.scheme() != "music-application" {
+            bail!("Подключение не относится к официальному клиенту Яндекс Музыки");
+        }
+        // Navigate inside the native application's origin, refreshing the search state
+        // even when its SPA does not react to a second incoming deep link.
+        page.set_path("/search");
+        page.set_query(None);
+        page.set_fragment(None);
+        page.query_pairs_mut().append_pair("text", &request.search);
+        chrome.navigate(page.as_str())?;
+        for _ in 0..28 {
+            if cancelled() {
+                bail!("Команда отменена");
+            }
+            let snapshot = match chrome.evaluate(NATIVE_SNAPSHOT) {
+                Ok(value) => value,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
+            };
+            let rows: Vec<MusicCandidate> =
+                serde_json::from_value(snapshot["rows"].clone()).unwrap_or_default();
+            if let Some(candidate) = select_candidate(&request, category, &rows) {
+                if playback_matches(&snapshot["playback"], candidate) {
+                    return Ok(format!("Уже играет: {}", candidate.title));
+                }
+                let mut clicked = false;
+                for _ in 0..16 {
+                    if cancelled() {
+                        bail!("Команда отменена");
+                    }
+                    if chrome.call_function(NATIVE_CLICK,json!([{"value":candidate.id},{"value":candidate.title},{"value":candidate.artist}])).ok() == Some(json!(true)) { clicked = true; break; }
+                    std::thread::sleep(Duration::from_millis(350));
+                }
+                if clicked {
+                    for _ in 0..24 {
+                        if cancelled() {
+                            bail!("Команда отменена");
+                        }
+                        let snapshot = chrome.evaluate(NATIVE_SNAPSHOT).unwrap_or_default();
+                        if playback_matches(&snapshot["playback"], candidate) {
+                            return Ok(format!(
+                                "Играет: {}{}",
+                                candidate.title,
+                                if candidate.artist.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" — {}", candidate.artist)
+                                }
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                    bail!("Найдено «{}», но клиент не подтвердил воспроизведение. Проверьте вход, подписку и доступность трека в Яндекс Музыке.",candidate.title);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        bail!("В приложении не найден подходящий результат для «{}». Уточните название и исполнителя либо проверьте вход в Яндекс Музыку.",request.search);
     }
 }
 
@@ -466,6 +765,85 @@ fn browser_executable(browser: &str) -> Result<PathBuf> {
 }
 
 impl Chrome {
+    fn call_function(&mut self, function: &str, arguments: Value) -> Result<Value> {
+        let context = self.context_id()?;
+        let result = self.call("Runtime.callFunctionOn",json!({"functionDeclaration":function,"arguments":arguments,"executionContextId":context,"returnByValue":true,"userGesture":true}))?;
+        if !result["exceptionDetails"].is_null() {
+            bail!("Клиент не смог выполнить управление воспроизведением");
+        }
+        Ok(result["result"]["value"].clone())
+    }
+    fn context_id(&mut self) -> Result<u64> {
+        let tree = self.call("Page.getFrameTree", json!({}))?;
+        let world = self.call(
+            "Page.createIsolatedWorld",
+            json!({"frameId":tree["frameTree"]["frame"]["id"],"worldName":"vasya-control"}),
+        )?;
+        world["executionContextId"]
+            .as_u64()
+            .context("Нет контекста музыкального приложения")
+    }
+
+    fn connect_saved(registry: ProcessRegistry) -> Result<Self> {
+        let data: Value = serde_json::from_slice(&std::fs::read(
+            crate::config::data_dir().join("yandex-cdp.json"),
+        )?)?;
+        let port = data["port"]
+            .as_u64()
+            .filter(|p| (1..=65535).contains(p))
+            .context("Некорректный порт клиента")?;
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(700))
+            .build()?;
+        let info: Value = client
+            .get(format!("http://127.0.0.1:{port}/json/version"))
+            .send()?
+            .json()?;
+        let endpoint = info["webSocketDebuggerUrl"].as_str().context("Нет CDP")?;
+        let endpoint_url = url::Url::parse(endpoint)?;
+        if endpoint_url.scheme() != "ws"
+            || endpoint_url.host_str() != Some("127.0.0.1")
+            || endpoint_url.port() != Some(port as u16)
+        {
+            bail!("Неверный адрес подключения клиента");
+        }
+        let (mut socket, _) = tungstenite::connect(endpoint)?;
+        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        }
+        let targets = rpc(&mut socket, 1, "Target.getTargets", json!({}), None)?;
+        let page = targets["targetInfos"]
+            .as_array()
+            .and_then(|ts| {
+                ts.iter().find(|t| {
+                    t["type"] == "page"
+                        && t["url"]
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("music-application://desktop/"))
+                })
+            })
+            .context("Не найдено окно Яндекс Музыки")?;
+        let attached = rpc(
+            &mut socket,
+            2,
+            "Target.attachToTarget",
+            json!({"targetId":page["targetId"],"flatten":true}),
+            None,
+        )?;
+        registry.lock().unwrap().keep_alive = true;
+        Ok(Self {
+            process: registry,
+            socket,
+            session: attached["sessionId"]
+                .as_str()
+                .context("Нет сессии клиента")?
+                .into(),
+            sequence: 3,
+            native: true,
+        })
+    }
     fn launch_native(
         executable: &std::path::Path,
         uri: &str,
@@ -527,6 +905,10 @@ impl Chrome {
                             json!({"targetId":page["targetId"],"flatten":true}),
                             None,
                         )?;
+                        let _ = std::fs::write(
+                            crate::config::data_dir().join("yandex-cdp.json"),
+                            json!({"port":port}).to_string(),
+                        );
                         return Ok(Self {
                             process: registry,
                             socket,
@@ -761,6 +1143,76 @@ impl Drop for Chrome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn track_artist_query_selects_the_right_performer_and_verifies_playback() {
+        let request = MusicQuery::parse("«Перемен» исполнителя Кино", &Category::Track);
+        assert_eq!(request.title, "Перемен");
+        assert_eq!(request.artist, "Кино");
+        assert_eq!(request.search, "Перемен Кино");
+        let rows = vec![
+            MusicCandidate {
+                id: "wrong".into(),
+                title: "Перемен".into(),
+                artist: "Другая группа".into(),
+                kind: "track".into(),
+            },
+            MusicCandidate {
+                id: "right".into(),
+                title: "Хочу перемен!".into(),
+                artist: "Кино".into(),
+                kind: "track".into(),
+            },
+        ];
+        let selected = select_candidate(&request, &Category::Track, &rows).unwrap();
+        assert_eq!(selected.id, "right");
+        assert!(!playback_matches(
+            &json!({"playing":true,"title":"Перемен","artist":"Другая группа"}),
+            selected
+        ));
+        assert!(playback_matches(
+            &json!({"playing":true,"title":"Хочу перемен!","artist":"Кино"}),
+            selected
+        ));
+        let english = MusicQuery::parse("Numb by Linkin Park", &Category::Track);
+        assert_eq!(english.search, "Numb Linkin Park");
+        assert_eq!(
+            MusicQuery::parse("Stand by Me", &Category::Track).title,
+            "Stand by Me"
+        );
+        let explicit = MusicQuery::parse("Stand by Me исполнителя Ben E. King", &Category::Track);
+        assert_eq!(explicit.title, "Stand by Me");
+        assert_eq!(explicit.artist, "Ben E. King");
+    }
+    #[test]
+    fn phonetic_titles_require_an_explicit_matching_artist() {
+        let rows = vec![
+            MusicCandidate {
+                id: "right".into(),
+                title: "Numb".into(),
+                artist: "Linkin Park".into(),
+                kind: "track".into(),
+            },
+            MusicCandidate {
+                id: "wrong".into(),
+                title: "Name".into(),
+                artist: "Different performer".into(),
+                kind: "track".into(),
+            },
+        ];
+        let request = MusicQuery::parse("нам исполнителя Lidkin Park", &Category::Track);
+        assert_eq!(
+            select_candidate(&request, &Category::Track, &rows)
+                .unwrap()
+                .id,
+            "right"
+        );
+        assert!(select_candidate(
+            &MusicQuery::parse("нам", &Category::Track),
+            &Category::Track,
+            &rows
+        )
+        .is_none());
+    }
     #[test]
     fn native_music_links_encode_queries_and_keep_them_inside_the_client() {
         let query = "Кино & AC/DC #1? трек";
