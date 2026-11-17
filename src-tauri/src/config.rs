@@ -182,16 +182,34 @@ mod tests {
             Path::new(&resolved.vosk_library),
             Path::new("installation/speech/vosk/libvosk.dll")
         );
+        assert_eq!(
+            Path::new(&resolved.vosk_model),
+            Path::new("installation/speech/models/vosk-model-small-ru-0.22")
+        );
         assert!(settings.vosk_library.is_empty());
         settings.vosk_model = "my-model".into();
         assert_eq!(
             resolve_speech(&settings, Path::new("updated-installation")).vosk_model,
             "my-model"
         );
-        settings.vosk_library = data_dir().join("vosk/libvosk.dll").to_string_lossy().into();
+        settings.vosk_library = data_dir()
+            .join("vosk")
+            .join("libvosk.dll")
+            .to_string_lossy()
+            .into();
+        settings.vosk_model = data_dir()
+            .join("models")
+            .join("vosk-model-small-ru-0.22")
+            .to_string_lossy()
+            .into();
+        let migrated = resolve_speech(&settings, Path::new("new"));
         assert_eq!(
-            resolve_speech(&settings, Path::new("new")).vosk_library,
-            Path::new("new/speech/vosk/libvosk.dll").to_string_lossy()
+            Path::new(&migrated.vosk_library),
+            Path::new("new/speech/vosk/libvosk.dll")
+        );
+        assert_eq!(
+            Path::new(&migrated.vosk_model),
+            Path::new("new/speech/models/vosk-model-small-ru-0.22")
         );
     }
     #[test]
@@ -221,7 +239,7 @@ pub fn resolve_speech(settings: &Settings, resources: &Path) -> Settings {
     let mut resolved = settings.clone();
     let legacy = data_dir();
     if settings.vosk_library.is_empty()
-        || settings.vosk_library == legacy.join("vosk/libvosk.dll").to_string_lossy()
+        || Path::new(&settings.vosk_library) == legacy.join("vosk/libvosk.dll")
     {
         resolved.vosk_library = resources
             .join("speech/vosk/libvosk.dll")
@@ -229,10 +247,7 @@ pub fn resolve_speech(settings: &Settings, resources: &Path) -> Settings {
             .into();
     }
     if settings.vosk_model.is_empty()
-        || settings.vosk_model
-            == legacy
-                .join("models/vosk-model-small-ru-0.22")
-                .to_string_lossy()
+        || Path::new(&settings.vosk_model) == legacy.join("models/vosk-model-small-ru-0.22")
     {
         resolved.vosk_model = resources
             .join("speech/models/vosk-model-small-ru-0.22")

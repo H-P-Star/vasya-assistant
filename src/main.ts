@@ -111,7 +111,7 @@ function shell() {
         <button data-page="settings">${icon('settings')}<span>Настройки</span></button>
         <button data-page="help">${icon('help')}<span>Команды и помощь</span></button>
       </nav>
-      <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<strong>Обработка на устройстве</strong><p>Речь распознаётся локально.<br>Ваш голос остаётся у вас.</p></div><span class="version">Вася для Windows <span>0.2.0</span></span></div>
+      <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<strong>Обработка на устройстве</strong><p>Речь распознаётся локально.<br>Ваш голос остаётся у вас.</p></div><span class="version">Вася для Windows <span>0.2.1</span></span></div>
     </aside>
     <main><div id="preview" ${native ? 'hidden' : ''}>Предпросмотр интерфейса · для работы с голосом запустите Windows-приложение</div><div id="content"></div></main>
     <div id="toast" role="status" aria-live="polite"></div>`;
