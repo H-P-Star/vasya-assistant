@@ -393,6 +393,27 @@ mod tests {
         }
     }
     #[test]
+    fn first_run_cannot_enable_background_capture_before_completion() {
+        let runtime = Runtime::start(
+            Settings::default(),
+            Arc::new(Fake::default()),
+            Arc::new(|_| {}),
+        );
+        runtime.shared.set_muted(false);
+        assert!(runtime.shared.muted.load(SeqCst));
+        runtime.shared.activate();
+        assert!(!runtime.shared.activate.load(SeqCst));
+        let settings = Settings {
+            onboarding_complete: true,
+            ..Settings::default()
+        };
+        runtime.update(settings);
+        runtime.shared.set_muted(false);
+        assert!(!runtime.shared.muted.load(SeqCst));
+        runtime.close();
+    }
+
+    #[test]
     fn cancelled_or_preview_text_is_retained_without_insertion() {
         let platform = Arc::new(Fake::default());
         let events = Arc::new(Mutex::new(Vec::new()));

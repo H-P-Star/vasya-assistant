@@ -111,7 +111,7 @@ function shell() {
         <button data-page="settings">${icon('settings')}<span>Настройки</span></button>
         <button data-page="help">${icon('help')}<span>Команды и помощь</span></button>
       </nav>
-      <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<strong>Обработка на устройстве</strong><p>Речь распознаётся локально.<br>Ваш голос остаётся у вас.</p></div><span class="version">Вася для Windows <span>0.1.0</span></span></div>
+      <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<strong>Обработка на устройстве</strong><p>Речь распознаётся локально.<br>Ваш голос остаётся у вас.</p></div><span class="version">Вася для Windows <span>0.2.0</span></span></div>
     </aside>
     <main><div id="preview" ${native ? 'hidden' : ''}>Предпросмотр интерфейса · для работы с голосом запустите Windows-приложение</div><div id="content"></div></main>
     <div id="toast" role="status" aria-live="polite"></div>`;
@@ -139,11 +139,12 @@ function render() {
     $('test-mic').onclick = async () => {
       if (!native) { toast('Проверка доступна в установленном приложении'); return; }
       const button = $('test-mic') as HTMLButtonElement;
-      button.disabled = true; $('mic-test').textContent = 'Микрофон включён на 2 секунды. Говорите…';
+      const output = $('mic-test');
+      button.disabled = true; output.textContent = 'Микрофон включён на 2 секунды. Говорите…';
       try {
         const level = await invoke<number>('test_microphone', {microphone: ($('microphone') as HTMLSelectElement).value});
-        $('mic-test').textContent = level > 0.005 ? 'Звук получен. Микрофон работает.' : 'Звук очень тихий. Проверьте устройство и громкость микрофона.';
-      } catch (e) { $('mic-test').textContent = String(e); }
+        output.textContent = level > 0.005 ? 'Звук получен. Микрофон работает.' : 'Звук очень тихий. Проверьте устройство и громкость микрофона.';
+      } catch (e) { output.textContent = String(e); }
       finally { button.disabled = false; }
     };
     $('finish-setup').onclick = async () => {
@@ -256,7 +257,10 @@ function settingsForm() {
     <div class="check-grid"><label><input type="checkbox" id="voice_feedback"/> Голосовое подтверждение</label><label><input type="checkbox" id="start_muted"/> Запускать с выключенным микрофоном</label><label><input type="checkbox" id="start_in_tray"/> Открывать сразу в трее</label></div></section>
     <section class="settings-card"><div class="card-title">${icon('shield')}<h2>Распознавание речи</h2><span class="tag">Локально</span></div>
     <label class="field">Режим<select id="speech_mode"><option value="vosk">Vosk — быстрые команды и диктовка</option><option value="whisper">Vosk + Whisper — уточнение активированных фраз</option></select></label>
+    <p class="form-note">Русское распознавание включено в установщик и готово к работе.</p>
+    <details><summary>Дополнительно: своя модель распознавания</summary>
     ${field('vosk_library', 'Библиотека Vosk', 'Оставьте пустым для встроенной библиотеки')}${field('vosk_model', 'Папка модели Vosk', 'Оставьте пустым для встроенной русской модели')}
+    </details>
     <div id="whisper-fields">${field('whisper_executable', 'Путь к whisper-cli.exe')}${field('whisper_model', 'Файл модели Whisper', 'Локальный ggml-base.bin или другая многоязычная модель whisper.cpp')}</div>
     <p class="form-note">Vosk нужен в обоих режимах для активации и определения границ фраз. Базовая русская модель включена в установщик; Whisper настраивается дополнительно.</p></section>
     <section class="settings-card"><div class="card-title">${icon('music')}<h2>Музыка и браузер</h2></div><div class="form-grid"><label class="field">Основной сервис<select id="music_service"><option value="yandex">Яндекс Музыка</option><option value="youtube">YouTube</option><option value="spotify">Spotify</option></select></label><label class="field">Браузер музыкального профиля<select id="browser"><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option></select></label></div>
