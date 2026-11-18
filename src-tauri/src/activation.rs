@@ -5,7 +5,12 @@ pub fn all_wake_words(settings: &crate::config::Settings) -> Vec<String> {
     settings
         .wake_words
         .iter()
-        .chain(&settings.wake_aliases)
+        .chain(
+            settings
+                .wake_aliases
+                .iter()
+                .filter(|w| w.chars().filter(|c| c.is_alphanumeric()).take(2).count() == 2),
+        )
         .map(|w| w.trim().to_lowercase())
         .collect()
 }
@@ -31,20 +36,32 @@ pub fn detected_body<'a>(text: &'a str, words: &[String]) -> &'a str {
     text
 }
 
-pub fn after_detected_wake(text: &str, settings: &crate::config::Settings) -> String {
-    let words = all_wake_words(settings);
-    let body = detected_body(text, &words);
-    let wake_only = text.split_whitespace().count() <= 1
-        && matches!(
-            crate::commands::parse_with_settings(body, false, settings),
-            crate::commands::Command::Unknown(_)
-        );
-    let word = words.first().map(String::as_str).unwrap_or("вася");
-    if body.is_empty() || wake_only {
-        word.into()
-    } else {
-        format!("{word} {body}")
+pub fn confirm_restricted_wake(
+    text: &str,
+    hypothesis: &str,
+    words: &[String],
+    settings: &crate::config::Settings,
+) -> Option<String> {
+    use crate::commands::Command;
+    // The restricted decoder can call a whole sentence "вася". The open-vocabulary
+    // result must independently resemble the vocative, at the start of the sentence.
+    let word = match hypothesis.split_whitespace().next()? {
+        word @ ("вась" | "вася") if words.iter().any(|w| w == word) => word,
+        _ => return None,
+    };
+    let shortened = ["вас", "ваш", "ваша"].map(String::from);
+    let body = strip_wake(text, &shortened)?;
+    if body.is_empty() {
+        return (word == "вась" && strip_wake(text, &shortened[..2]).is_some())
+            .then(|| word.into());
     }
+    if matches!(
+        crate::commands::parse_with_settings(body, false, settings),
+        Command::Unknown(_) | Command::Invalid(_) | Command::Disabled
+    ) {
+        return None;
+    }
+    Some(format!("{word} {body}"))
 }
 
 pub fn strip_wake<'a>(text: &'a str, words: &[String]) -> Option<&'a str> {
@@ -150,25 +167,43 @@ mod tests {
         assert_eq!(detected_body("Vasya, play Numb", &words), "play Numb");
     }
     #[test]
-    fn a_confirmed_short_wake_is_not_sent_as_an_unknown_llm_request() {
+    fn restricted_wake_requires_corroboration_from_the_full_transcript() {
         let settings = crate::config::Settings::default();
         let words = all_wake_words(&settings);
-        for text in ["базе", "вас", "ваша"] {
+        for text in [
+            "базе",
+            "Ваша очередь",
+            "ваш тот",
+            "вания включи музыку",
+            "я говорю про вася",
+            "включи музыку",
+            "в",
+            "василий включи музыку",
+        ] {
             assert_eq!(
-                strip_wake(&after_detected_wake(text, &settings), &words),
-                Some("")
+                confirm_restricted_wake(text, "вася", &words, &settings),
+                None
             );
         }
         assert_eq!(
-            strip_wake(&after_detected_wake("пауза", &settings), &words),
-            Some("пауза")
+            confirm_restricted_wake("ваша", "вася", &words, &settings),
+            None
         );
         assert_eq!(
-            strip_wake(
-                &after_detected_wake("ваша включи трек Numb", &settings),
-                &words
-            ),
-            Some("включи трек Numb")
+            confirm_restricted_wake("вода", "вась", &words, &settings),
+            None
+        );
+        assert_eq!(
+            confirm_restricted_wake("ваш", "вась", &words, &settings).as_deref(),
+            Some("вась")
+        );
+        assert_eq!(
+            confirm_restricted_wake("ваша включи трек Numb", "вася", &words, &settings).as_deref(),
+            Some("вася включи трек Numb")
+        );
+        assert_eq!(
+            confirm_restricted_wake("вас включи музыку", "[unk] вася", &words, &settings),
+            None
         );
     }
     fn gate(mode: Activation) -> Gate {

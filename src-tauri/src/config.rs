@@ -27,6 +27,14 @@ pub enum LlmProvider {
     Compatible,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmStyle {
+    Neutral,
+    Casual,
+    Bold,
+}
+
 impl LlmProvider {
     pub fn credential_id(&self) -> &'static str {
         match self {
@@ -66,6 +74,22 @@ pub struct VoicePreset {
     pub model: String,
     pub speaker: u32,
     pub rate: i32,
+    #[serde(default)]
+    pub fish_voice: String,
+    #[serde(default = "default_fish_model")]
+    pub fish_model: String,
+}
+
+fn default_fish_model() -> String {
+    "s2.1-pro-free".into()
+}
+
+fn validate_voice_engine(engine: &str, fish_voice: &str, fish_model: &str) -> Result<()> {
+    match engine {
+        "windows" | "piper" => Ok(()),
+        "fish_audio" => crate::voice::validate_fish_voice(fish_voice, fish_model),
+        _ => bail!("Неизвестный движок голоса"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +125,8 @@ pub struct Settings {
     pub noise_floor: f32,
     pub wake_aliases: Vec<String>,
     pub speech_corrections: Vec<SpeechCorrection>,
+    pub llm_repair_speech: bool,
+    pub web_search_url: String,
     pub music_service: String,
     pub browser: String,
     pub music_mode: String,
@@ -116,6 +142,8 @@ pub struct Settings {
     pub piper_executable: String,
     pub piper_model: String,
     pub piper_speaker: u32,
+    pub fish_voice: String,
+    pub fish_model: String,
     pub voice_presets: Vec<VoicePreset>,
     pub start_muted: bool,
     pub start_in_tray: bool,
@@ -124,6 +152,7 @@ pub struct Settings {
     pub llm_url: String,
     pub llm_model: String,
     pub llm_structured: bool,
+    pub llm_style: LlmStyle,
     pub aliases: Vec<Alias>,
     pub builtin_overrides: Vec<BuiltinOverride>,
 }
@@ -154,6 +183,8 @@ impl Default for Settings {
             noise_floor: 0.003,
             wake_aliases: Vec::new(),
             speech_corrections: Vec::new(),
+            llm_repair_speech: true,
+            web_search_url: String::new(),
             music_service: "yandex".into(),
             browser: "edge".into(),
             music_mode: "desktop".into(),
@@ -169,6 +200,8 @@ impl Default for Settings {
             piper_executable: String::new(),
             piper_model: String::new(),
             piper_speaker: 0,
+            fish_voice: String::new(),
+            fish_model: default_fish_model(),
             voice_presets: Vec::new(),
             start_muted: false,
             start_in_tray: false,
@@ -177,6 +210,7 @@ impl Default for Settings {
             llm_url: "http://198.18.0.1:1234".into(),
             llm_model: "google/gemma-3-4b".into(),
             llm_structured: true,
+            llm_style: LlmStyle::Casual,
             aliases: Vec::new(),
             builtin_overrides: Vec::new(),
         }
@@ -185,6 +219,9 @@ impl Default for Settings {
 
 impl Settings {
     pub fn validate(&self) -> Result<()> {
+        if !self.web_search_url.trim().is_empty() {
+            crate::web_search::searx_endpoint(&self.web_search_url)?;
+        }
         if self.wake_words.is_empty() || self.wake_words.iter().any(|w| w.trim().is_empty()) {
             bail!("Укажите хотя бы одно слово активации");
         }
@@ -252,18 +289,17 @@ impl Settings {
         {
             bail!("Некорректный словарь исправлений речи");
         }
-        if !["windows", "piper"].contains(&self.tts_engine.as_str())
-            || self.tts_volume > 100
+        validate_voice_engine(&self.tts_engine, &self.fish_voice, &self.fish_model)?;
+        if self.tts_volume > 100
             || !(-10..=10).contains(&self.tts_rate)
             || self.voice_presets.len() > 32
         {
             bail!("Проверьте параметры голоса");
         }
         for preset in &self.voice_presets {
-            if preset.name.trim().is_empty()
-                || !["windows", "piper"].contains(&preset.engine.as_str())
-                || !(-10..=10).contains(&preset.rate)
-            {
+            validate_voice_engine(&preset.engine, &preset.fish_voice, &preset.fish_model)
+                .with_context(|| format!("Проверьте пресет голоса «{}»", preset.name))?;
+            if preset.name.trim().is_empty() || !(-10..=10).contains(&preset.rate) {
                 bail!("Некорректный пресет голоса");
             }
         }
@@ -322,6 +358,7 @@ fn validate_aliases(aliases: &[Alias]) -> Result<()> {
                 "open_spotify",
                 "cancel",
                 "search",
+                "web_answer",
                 "music",
                 "music_artist",
                 "music_playlist",
@@ -363,6 +400,7 @@ fn validate_aliases(aliases: &[Alias]) -> Result<()> {
         }
         if [
             "search",
+            "web_answer",
             "youtube",
             "generate",
             "insert",

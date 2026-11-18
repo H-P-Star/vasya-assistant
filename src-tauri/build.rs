@@ -25,6 +25,8 @@ fn main() {
             "test_voice",
             "restart_music_app",
             "cancel_current",
+            "clear_conversation",
+            "open_answer_link",
             "open_resource",
         ]),
     ))

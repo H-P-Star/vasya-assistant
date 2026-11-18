@@ -11,7 +11,8 @@
     "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.8.0"
+    "@tauri-apps/api": "^2.8.0",
+    "markdown-it": "15.0.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.0",

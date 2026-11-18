@@ -1,5 +1,5 @@
 use crate::{
-    activation::{strip_wake, Accepted, Gate},
+    activation::{confirm_restricted_wake, strip_wake, Accepted, Gate},
     config::{Activation, Settings, SpeechMode},
     runtime::{Shared, Task},
     speech::Vosk,
@@ -161,13 +161,12 @@ pub fn calibrate(
         vosk.configure_wake(&words, Path::new(&resolved.vosk_model))?;
     }
     let mut transcripts = Vec::new();
-    let mut detected = false;
     for chunk in scaled.chunks(1600) {
         if state.cancelled(epoch) {
             bail!("Калибровка отменена");
         }
         if is_wake {
-            detected |= strip_wake(&vosk.wake(chunk)?, &words).is_some();
+            vosk.feed_wake(chunk)?;
         }
         if let Some(text) = vosk.accept(chunk)? {
             transcripts.push(text);
@@ -175,6 +174,9 @@ pub fn calibrate(
     }
     transcripts.push(vosk.finish()?);
     let text = transcripts.join(" ").trim().to_string();
+    let detected = is_wake
+        && (strip_wake(&text, &words).is_some()
+            || confirm_restricted_wake(&text, &vosk.finish_wake()?, &words, &settings).is_some());
     let refined = if !is_wake && settings.speech_mode == SpeechMode::Whisper {
         crate::speech::whisper_configured(&resolved, &scaled, || state.cancelled(epoch))?
     } else {
@@ -185,7 +187,7 @@ pub fn calibrate(
     if is_wake && detected {
         report.matches = true;
         report.wake_candidate = None;
-        report.message="Обращение распознано отдельным детектором. Общий текст Vosk может отличаться — вариант вызова уже работает.".into();
+        report.message = "Обращение подтверждено. Вася активируется после окончания фразы.".into();
     }
     Ok(report)
 }
@@ -417,19 +419,21 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
         16000.0,
     )?;
     let wake_words = crate::activation::all_wake_words(&settings);
-    vosk.configure_wake(&wake_words, Path::new(&settings.vosk_model))?;
+    if settings.llm_repair_speech {
+        vosk.enable_word_confidence();
+    }
+    if settings.activation != Activation::Hotkey {
+        vosk.configure_wake(&wake_words, Path::new(&settings.vosk_model))?;
+    }
     let mut gate = Gate::new(
         settings.activation.clone(),
-        crate::activation::all_wake_words(&settings),
+        wake_words.clone(),
         settings.command_timeout,
     );
     let mut input = None;
     let mut utterance = Vec::new();
     let mut epoch = state.epoch.load(SeqCst);
     let mut status = String::new();
-    let mut wake_previewed = false;
-    let mut wake_detected = false;
-    let mut partial_at = Instant::now();
     while !state.stop.load(SeqCst) && state.config_version.load(SeqCst) == version {
         let now = Instant::now();
         if epoch != state.epoch.load(SeqCst) {
@@ -437,8 +441,6 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             gate.reset();
             vosk.reset();
             utterance.clear();
-            wake_previewed = false;
-            wake_detected = false;
             input = None;
             state.capture_open.store(false, SeqCst);
         }
@@ -447,8 +449,6 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             input = None;
             state.capture_open.store(false, SeqCst);
             gate.arm(now);
-            wake_previewed = false;
-            wake_detected = false;
             vosk.reset();
             utterance.clear();
         }
@@ -480,8 +480,6 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             state.capture_open.store(false, SeqCst);
             vosk.reset();
             utterance.clear();
-            wake_previewed = false;
-            wake_detected = false;
             if muted || busy {
                 gate.reset();
             }
@@ -509,18 +507,11 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             .sum::<f32>()
             / samples.len().max(1) as f32)
             .sqrt();
-        if !gate.armed(now)
-            && !dictating
-            && !wake_previewed
-            && rms < settings.noise_floor
-            && utterance.len() > 32000
-        {
+        if !gate.armed(now) && !dictating && rms < settings.noise_floor && utterance.len() > 32000 {
             utterance.drain(..utterance.len() - 16000);
         }
         if utterance.len() > 16000 * 30 {
             utterance.clear();
-            wake_previewed = false;
-            wake_detected = false;
             vosk.reset();
             gate.reset();
             state.emit(
@@ -529,39 +520,33 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             );
             continue;
         }
-        if !dictating && settings.activation != Activation::Hotkey {
-            let hypothesis = vosk.wake(&samples)?;
-            if strip_wake(&hypothesis, &wake_words).is_some() {
-                wake_detected = true;
-                gate.arm(Instant::now());
-                if !wake_previewed {
-                    state.target.store(state.platform.foreground(), SeqCst);
-                    state.emit("activated", "Слушаю команду…");
-                }
-                wake_previewed = true;
-            }
+        let voice_wake = !dictating && settings.activation != Activation::Hotkey;
+        if voice_wake && !gate.armed(now) {
+            vosk.feed_wake(&samples)?;
         }
-        if let Some(text) = vosk.accept(&samples)? {
-            let had_wake =
-                !dictating && (wake_detected || strip_wake(&text, &wake_words).is_some());
-            let text = if wake_detected {
-                crate::activation::after_detected_wake(&text, &settings)
+        if let Some((text, confidence)) = vosk.accept_transcript(&samples)? {
+            let text = if voice_wake && !gate.armed(now) && strip_wake(&text, &wake_words).is_none()
+            {
+                confirm_restricted_wake(&text, &vosk.finish_wake()?, &wake_words, &settings)
+                    .unwrap_or(text)
             } else {
                 text
             };
+            let had_wake = voice_wake && strip_wake(&text, &wake_words).is_some();
             match gate.accept(&text, dictating, Instant::now()) {
                 Accepted::Wake => {
-                    if !wake_previewed {
-                        state.target.store(state.platform.foreground(), SeqCst);
-                    }
+                    state.target.store(state.platform.foreground(), SeqCst);
                     state.emit("activated", "Слушаю команду…");
                     state.emit("status", "Слушаю команду…");
                 }
                 Accepted::Command(body) => {
+                    let uncertain = confidence
+                        .iter()
+                        .rev()
+                        .take(body.split_whitespace().count())
+                        .any(|&word| word < 0.72);
                     if had_wake {
-                        if !wake_previewed {
-                            state.target.store(state.platform.foreground(), SeqCst);
-                        }
+                        state.target.store(state.platform.foreground(), SeqCst);
                         state.emit("activated", "Слушаю команду…");
                     }
                     let target = state.target.load(SeqCst);
@@ -581,6 +566,7 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
                                 samples,
                                 had_wake,
                                 dictating,
+                                uncertain,
                             })
                             .is_err()
                         {
@@ -588,30 +574,10 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
                         }
                     }
                 }
-                Accepted::Ignore => {
-                    if wake_previewed {
-                        state.emit("deactivated", "");
-                    }
-                }
+                Accepted::Ignore => {}
             }
             utterance.clear();
             vosk.reset_wake();
-            wake_previewed = false;
-            wake_detected = false;
-        } else if !wake_previewed
-            && !dictating
-            && !gate.armed(Instant::now())
-            && settings.activation != Activation::Hotkey
-            && partial_at.elapsed() >= Duration::from_millis(200)
-        {
-            partial_at = Instant::now();
-            // A partial hypothesis may show the UI, but only the final transcript
-            // can arm the gate or execute a command.
-            if strip_wake(&vosk.partial()?, &wake_words).is_some() {
-                wake_previewed = true;
-                state.target.store(state.platform.foreground(), SeqCst);
-                state.emit("activated", "Слушаю команду…");
-            }
         }
     }
     drop(input);

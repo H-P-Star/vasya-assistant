@@ -34,10 +34,8 @@ fn main() -> Result<()> {
     let words = vec!["вась".to_string(), "вася".to_string()];
     vosk.configure_wake(&words, std::path::Path::new(&args[2]))?;
     let mut transcript = Vec::new();
-    let mut detected = false;
     for chunk in samples.chunks(1600) {
-        let wake = vosk.wake(chunk)?;
-        detected |= vasya::activation::strip_wake(&wake, &words).is_some();
+        vosk.feed_wake(chunk)?;
         if let Some(text) = vosk.accept(chunk)? {
             transcript.push(text);
         }
@@ -50,6 +48,15 @@ fn main() -> Result<()> {
         speech_hint: "Вася, Вась. Linkin Park, Numb, Кино, Перемен.".into(),
         ..Default::default()
     };
+    let text = transcript.join(" ");
+    let detected = vasya::activation::strip_wake(&text, &words).is_some()
+        || vasya::activation::confirm_restricted_wake(
+            &text,
+            &vosk.finish_wake()?,
+            &words,
+            &settings,
+        )
+        .is_some();
     println!(
         "{}",
         serde_json::json!({"wake_detected":detected,"vosk":transcript.join(" ").trim()})

@@ -109,6 +109,18 @@ pub fn builtin_catalog() -> Vec<Builtin> {
             ],
         ),
         (
+            "web_answer",
+            "Найти ответ в интернете",
+            "web_answer",
+            vec![
+                "узнай в интернете {query}",
+                "проверь в интернете {query}",
+                "найди ответ в интернете {query}",
+                "поищи в интернете {query} и ответь",
+                "найди в интернете {query} и ответь",
+            ],
+        ),
+        (
             "youtube",
             "Видео YouTube",
             "youtube",
@@ -312,6 +324,7 @@ pub enum Command {
     OpenMusic(String),
     Youtube(String),
     Search(String),
+    WebAnswer(String),
     Generate(String),
     Insert(String),
     Pause,
@@ -532,6 +545,16 @@ pub fn parse(text: &str, dictating: bool, aliases: &[Alias]) -> Command {
     if let Some(body) = prefix(
         text,
         &[
+            "узнай в интернете",
+            "проверь в интернете",
+            "найди ответ в интернете",
+        ],
+    ) {
+        return Command::WebAnswer(body.into());
+    }
+    if let Some(body) = prefix(
+        text,
+        &[
             "найди в браузере",
             "поищи в браузере",
             "найди в интернете",
@@ -633,6 +656,7 @@ fn match_alias_rule<'a>(text: &str, aliases: &'a [Alias]) -> Option<(&'a Alias, 
 fn alias_command(action: &str, payload: &str) -> Option<Command> {
     Some(match action {
         "search" => Command::Search(payload.into()),
+        "web_answer" => Command::WebAnswer(payload.into()),
         "youtube" => Command::Youtube(payload.into()),
         "music" | "music_artist" | "music_playlist" => Command::Music {
             query: payload.into(),
@@ -666,6 +690,28 @@ fn alias_command(action: &str, payload: &str) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn web_answer_uses_its_own_command_and_preserves_browser_search() {
+        let settings = crate::config::Settings::default();
+        for (phrase, expected) in [
+            (
+                "узнай в интернете, что такое IPv6",
+                Command::WebAnswer("что такое IPv6".into()),
+            ),
+            (
+                "поищи в интернете IPv6 и ответь",
+                Command::WebAnswer("IPv6".into()),
+            ),
+            ("найди в интернете IPv6", Command::Search("IPv6".into())),
+            ("найди IPv6 на ютубе", Command::Youtube("IPv6".into())),
+        ] {
+            assert_eq!(
+                parse_with_settings(phrase, false, &settings),
+                expected,
+                "{phrase}"
+            );
+        }
+    }
     #[test]
     fn changing_music_does_not_swallow_youtube_and_old_video_phrases_stay_blocked() {
         use crate::config::{BuiltinOverride, Settings};

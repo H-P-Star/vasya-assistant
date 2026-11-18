@@ -31,6 +31,7 @@ struct Bootstrap {
     last_error: Option<String>,
     last_result: String,
     llm_key_set: bool,
+    fish_key_set: bool,
 }
 
 #[tauri::command]
@@ -62,6 +63,7 @@ fn get_state(runtime: State<'_, Runtime>, errors: State<'_, StartupErrors>) -> B
         llm_key_set: crate::credentials::present(
             runtime.shared.snapshot().llm_provider.credential_id(),
         ),
+        fish_key_set: crate::credentials::present("fish_audio"),
     }
 }
 
@@ -95,10 +97,21 @@ fn open_resource(kind: String) -> Result<(), String> {
         "voices" => "https://huggingface.co/rhasspy/piper-voices/tree/v1.0.0/ru/ru_RU",
         "open_router" => "https://openrouter.ai/keys",
         "open_ai" => "https://platform.openai.com/api-keys",
+        "fish_audio" => "https://fish.audio/app/developers/get-started/",
+        "fish_voices" => "https://fish.audio/app/discovery/",
         "docs" => "https://github.com/H-P-Star/vasya-assistant#readme",
         _ => return Err("Для этого сервиса используйте сайт его поставщика".into()),
     };
     crate::browser::open_external(url).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn open_answer_link(url: String) -> Result<(), String> {
+    let url = url::Url::parse(&url).map_err(|e| e.to_string())?;
+    if !crate::web_search::public_url(&url) {
+        return Err("Можно открыть только публичную веб-ссылку".into());
+    }
+    crate::browser::open_external(url.as_str()).map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -141,6 +154,12 @@ fn cancel_current(runtime: State<'_, Runtime>) {
     runtime.shared.activate.store(false, SeqCst);
     runtime.shared.dictating.store(false, SeqCst);
     runtime.shared.emit("deactivated", "");
+}
+
+#[tauri::command]
+fn clear_conversation(runtime: State<'_, Runtime>) -> bool {
+    runtime.shared.clear_conversation();
+    true
 }
 
 #[tauri::command]
@@ -273,6 +292,7 @@ fn run_text(text: String, runtime: State<'_, Runtime>) -> Result<(), String> {
             samples: None,
             had_wake: false,
             dictating: false,
+            uncertain: false,
         })
         .map_err(|e| e.to_string())
 }
@@ -554,6 +574,8 @@ pub fn run() {
             test_voice,
             restart_music_app,
             cancel_current,
+            clear_conversation,
+            open_answer_link,
             open_resource
         ])
         .build(tauri::generate_context!())

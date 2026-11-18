@@ -4,3 +4,4 @@ html.island-page,.island-page body{margin:0;min-width:0;background:transparent!i
 @keyframes island-open{from{opacity:0;transform:scaleX(.7) scaleY(.85) translateY(-8px)}to{opacity:1;transform:none}}@keyframes island-flow{from{opacity:0;transform:translateY(-13px)}to{opacity:1;transform:none}}@keyframes island-breathe{50%{opacity:.35}}
 @media(prefers-reduced-motion:reduce){.island-shell,.island-answer,.thinking .island-symbol,.thinking .island-meter i{animation:none;transition:none}}
 .expanded{display:flex;flex-direction:column;max-height:calc(100vh - 16px)}.expanded .island-pill,.island-answer-heading,.island-answer footer{flex-shrink:0}.expanded .island-answer{min-height:0;overflow:hidden;flex:1}.island-answer article{max-height:calc(100vh - 224px);min-height:0;flex:1}
+.island-answer article.markdown-body{white-space:normal;line-height:1.65}

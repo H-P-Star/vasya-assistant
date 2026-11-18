@@ -2,11 +2,12 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import './style.css';
 import { startIsland } from './island';
+import { renderMarkdown } from './markdown';
 
 import type {Settings,Alias,Builtin,BuiltinOverride} from './types';
 import {calibrationUI} from './calibration-ui';
 type Snapshot = {speech_ready: boolean; settings: Settings; muted: boolean; busy: boolean; capture_open: boolean;
-  data_directory: string; errors: string[]; status: string; last_error: string | null; last_result: string; llm_key_set: boolean};
+  data_directory: string; errors: string[]; status: string; last_error: string | null; last_result: string; llm_key_set: boolean; fish_key_set: boolean};
 type AssistantEvent = {kind: string; text: string; level: number};
 
 const native = isTauri();
@@ -14,11 +15,13 @@ let settings: Settings = {
   onboarding_complete: false, wake_words: ['вась', 'вася'], activation: 'both', hotkey: 'Ctrl+Alt+Space', microphone: '',
   vosk_library: '', vosk_model: '', speech_mode: 'whisper', whisper_executable: '', whisper_model: '',
   speech_language:'auto',speech_hint:'',speech_gain:1,noise_floor:0.003,wake_aliases:[],speech_corrections:[],
+  llm_repair_speech:true, web_search_url:'',
   tts_engine:'windows',tts_voice:'',tts_volume:80,tts_rate:0,piper_executable:'',piper_model:'',piper_speaker:0,voice_presets:[],
+  fish_voice:'', fish_model:'s2.1-pro-free',
   music_service: 'yandex', browser: 'edge', music_mode: 'desktop', yandex_app_path: '', spotify_app_path: '',
   island_enabled: true, llm_fallback: true, voice_feedback: true, start_muted: false,
   start_in_tray: false, command_timeout: 10, llm_provider: 'lm_studio', llm_url: 'http://198.18.0.1:1234',
-  llm_model: 'google/gemma-3-4b',llm_structured:true, aliases: [],builtin_overrides:[],
+  llm_model: 'google/gemma-3-4b',llm_structured:true, llm_style:'casual', aliases: [],builtin_overrides:[],
 };
 let connected=!native;
 let speechReady = false;
@@ -33,8 +36,10 @@ let builtinDraft: BuiltinOverride[] | undefined;
 let builtins: Builtin[]=[];
 let voices: {id:string;name:string}[]=[];
 let keySet=false;
+let fishKeySet = false;
 let error = '';
 let result = '';
+let previewResult = true;
 let heard = '';
 let dataDirectory = '%LOCALAPPDATA%\\Vasya';
 let devices: string[] = [];
@@ -77,6 +82,18 @@ function log(kind: string, text: string) {
 function showError() {
   const area = document.getElementById('error');
   if (area) { area.hidden = !error; area.querySelector('span')!.textContent = error; }
+}
+function displayResult() {
+  const panel = document.getElementById('result-panel');
+  if (!panel) return;
+  panel.hidden = !result;
+  const editor = $('result') as HTMLTextAreaElement;
+  const preview = $('result-preview');
+  editor.value = result;
+  editor.hidden = previewResult;
+  preview.hidden = !previewResult;
+  $('toggle-result').textContent = previewResult ? 'Редактировать' : 'Предпросмотр';
+  if (previewResult) renderMarkdown(preview, result);
 }
 function renderHistory() {
   const area = document.getElementById('history');
@@ -178,11 +195,11 @@ function render() {
       <div class="context-strip"><span>${icon('music', 17)} <strong>${serviceNames[settings.music_service]}</strong></span><span>${icon('shield', 17)} ${settings.speech_mode === 'vosk' ? 'Vosk' : 'Vosk + Whisper'} · на устройстве</span><button id="quick-settings">Настроить ${icon('arrow', 16)}</button></div>
       <section class="examples"><div class="section-heading"><h2>С чего начнём?</h2><span>Нажмите, чтобы попробовать</span></div><div class="example-grid">
         <button data-command="включи исполнителя Кино"><span class="example-icon peach">${icon('music')}</span><strong>Музыку под настроение</strong><span>«Вась, включи исполнителя Кино»</span></button>
-        <button data-command="найди в браузере что такое IPv6"><span class="example-icon lilac">${icon('arrow')}</span><strong>Найти в интернете</strong><span>«Вась, найди, что такое IPv6»</span></button>
+        <button data-command="узнай в интернете что такое IPv6"><span class="example-icon lilac">${icon('arrow')}</span><strong>Найти ответ в интернете</strong><span>«Вась, узнай в интернете, что такое IPv6»</span></button>
         <button data-command="напиши, что такое IPv6"><span class="example-icon mint">${icon('key')}</span><strong>Помочь с текстом</strong><span>«Вась, напиши, что такое IPv6»</span></button>
       </div></section>
-      <section class="command-box"><label for="command">Или введите команду</label><form id="command-form"><input id="command" placeholder="Например: включи видео о космосе на ютубе" maxlength="8000" autocomplete="off"/><button class="icon-button" type="submit" aria-label="Выполнить команду">${icon('arrow')}</button></form><p>Диктовка и генерация из этой строки показывают текст в результате.</p></section>
-      <section id="result-panel" class="result-panel" ${result ? '' : 'hidden'}><div class="section-heading"><h2>Результат</h2><div><button id="copy" class="text-button">${icon('copy', 15)} Копировать</button><button id="show-last-result" class="text-button">Открыть в панели</button><button id="insert" class="text-button">Вставить через 3 секунды ${icon('arrow', 15)}</button></div></div><textarea id="result" aria-label="Результат распознавания или генерации" spellcheck="true"></textarea><p>Для вставки выберите целевое поле после нажатия кнопки.</p></section>
+      <section class="command-box"><div class="section-heading"><label for="command">Сообщение или команда</label><button id="new-dialogue" type="button" class="text-button">Новый разговор</button></div><form id="command-form"><input id="command" placeholder="Например: расскажи анекдот про программистов" maxlength="8000" autocomplete="off"/><button class="icon-button" type="submit" aria-label="Выполнить команду">${icon('arrow')}</button></form></section>
+      <section id="result-panel" class="result-panel" ${result ? '' : 'hidden'}><div class="section-heading"><h2>Результат</h2><div><button id="toggle-result" class="text-button">Редактировать</button><button id="copy" class="text-button">${icon('copy', 15)} Копировать</button><button id="show-last-result" class="text-button">Открыть в панели</button><button id="insert" class="text-button">Вставить через 3 секунды ${icon('arrow', 15)}</button></div></div><article id="result-preview" class="markdown-body"></article><textarea id="result" aria-label="Результат распознавания или генерации" spellcheck="true" hidden></textarea><p>Для вставки выберите целевое поле после нажатия кнопки.</p></section>
       <section class="history"><div class="section-heading"><h2>Последние действия</h2><button id="clear-history" class="text-button">Очистить</button></div><ul id="history"></ul></section>`;
     $('listen').onclick = () => { void call('activate'); };
     $('mic-toggle').onclick = async () => {
@@ -203,8 +220,16 @@ function render() {
       const input = $('command') as HTMLInputElement;
       input.value = button.dataset.command!; input.focus();
     });
-    ($('result') as HTMLTextAreaElement).value = result;
+    $('new-dialogue').onclick = async () => {
+      if (await call<boolean>('clear_conversation')) toast('Начат новый разговор.');
+    };
+    displayResult();
     $('result').oninput = () => { result = ($('result') as HTMLTextAreaElement).value; };
+    $('toggle-result').onclick = () => {
+      previewResult = !previewResult;
+      displayResult();
+      if (!previewResult) $('result').focus();
+    };
     $('show-last-result').onclick=()=>{void call('show_last_result');};
     $('copy').onclick = async () => { try { await navigator.clipboard.writeText(result); toast('Текст скопирован'); } catch { toast('Выделите текст и нажмите Ctrl+C'); } };
     $('insert').onclick = () => { toast('Выберите поле для вставки. Вставка через 3 секунды.'); void call('insert_result', {text: result}); };
@@ -265,6 +290,7 @@ function render() {
         ['Воспроизведение', 'пауза / продолжи / следующий трек'],
         ['Громкость', 'громче / тише / громкость 35 процентов'],
         ['Поиск', 'найди в браузере что такое IPv6'],
+        ['Ответ из интернета', 'узнай в интернете, что такое IPv6'],
         ['Видео', 'включи видео о космосе на ютубе'],
         ['Разовая диктовка', 'диктуй Привет, Анна'],
         ['Непрерывная диктовка', 'начни диктовку → текст → стоп диктовка'],
@@ -280,7 +306,7 @@ function render() {
 const commandActions: Record<string, string> = {
   open_yandex:'Открыть Яндекс Музыку',open_spotify:'Открыть Spotify',cancel:'Отмена',
   music: 'Включить трек', music_artist: 'Включить исполнителя', music_playlist: 'Включить плейлист',
-  search: 'Поиск в браузере', youtube: 'Видео YouTube', generate: 'Сгенерировать текст',
+  search: 'Поиск в браузере', web_answer: 'Ответ из интернета', youtube: 'Видео YouTube', generate: 'Сгенерировать текст',
   insert: 'Вставить текст', answer: 'Ответить фразой', launch_app: 'Открыть программу (.exe)',
   pause: 'Пауза', resume: 'Продолжить музыку', next: 'Следующий трек', volume: 'Громкость 0–100',
   volume_up: 'Громче', volume_down: 'Тише', dictation_start: 'Начать диктовку',
@@ -365,22 +391,83 @@ function field(name: string, label: string, hint = '', type = 'text') {
 }
 function voiceForm(){
   const available=[...voices];if(settings.tts_voice&&!available.some(v=>v.id===settings.tts_voice))available.push({id:settings.tts_voice,name:'Сохранённый голос'});
-  return `<section class="settings-card"><div class="card-title">${icon('mic')}<h2>Голос Васи</h2></div><label class="field">Движок<select id="tts_engine"><option value="windows">Голоса Windows · без загрузок</option><option value="piper">Piper · скачанный нейросетевой голос</option></select></label><div id="windows-voice"><label class="field">Установленный голос<select id="tts_voice"><option value="">Голос Windows по умолчанию</option>${available.map(v=>`<option value="${esc(v.id)}">${esc(v.name)}</option>`).join('')}</select></label></div>
+  return `<section class="settings-card"><div class="card-title">${icon('mic')}<h2>Голос Васи</h2></div><label class="field">Движок<select id="tts_engine"><option value="windows">Голоса Windows · без загрузок</option><option value="piper">Piper · скачанный нейросетевой голос</option><option value="fish_audio">Fish Audio · облако</option></select></label><div id="windows-voice"><label class="field">Установленный голос<select id="tts_voice"><option value="">Голос Windows по умолчанию</option>${available.map(v=>`<option value="${esc(v.id)}">${esc(v.name)}</option>`).join('')}</select></label></div>
   <div id="piper-voice">${field('piper_executable','Путь к piper.exe','Распакуйте весь архив Windows x64 вместе с DLL')}${field('piper_model','Модель голоса .onnx','Рядом должен лежать файл с тем же именем .onnx.json')}<label class="field">Номер диктора<input id="piper_speaker" type="number" min="0" max="10000"/><small>Обычно 0. Другие номера используются только многоголосыми моделями.</small></label><p class="form-note">Можно переключать мужские и женские модели, например русские Dmitri и Irina. Голоса и их конфигурации скачиваются отдельно. Для готового piper.exe используйте совместимые голоса v1.0.0: скачайте .onnx и .onnx.json с одинаковым именем.</p><div class="command-toolbar"><button type="button" class="text-button" data-resource="piper">Скачать piper.exe</button><button type="button" class="text-button" data-resource="voices">Мужские и женские голоса RU</button><button type="button" class="text-button" data-resource="docs">Инструкция</button></div></div>
+  <div id="fish-voice" hidden>
+    <div class="form-grid">${field('fish_voice', 'ID или ссылка на голос', 'Скопируйте ID или адрес страницы выбранного голоса Fish Audio.')}
+    <label class="field">Модель синтеза<select id="fish_model"><option value="s2.1-pro-free">S2.1 Pro Free</option><option value="s2.1-pro">S2.1 Pro · платная</option><option value="s2-pro">S2 Pro · платная</option></select></label></div>
+    <div class="api-key-row"><label class="field">API-ключ Fish Audio<input id="fish-api-key" type="password" autocomplete="off" spellcheck="false"/></label><button type="button" class="secondary" id="save-fish-key">Сохранить ключ</button><button type="button" class="text-button" id="delete-fish-key">Удалить ключ</button></div>
+    <p id="fish-key-status" class="form-note" role="status"></p>
+    <p class="form-note">Fish Audio получает текст озвучиваемых ответов. Ключ хранится под защитой Windows.</p>
+    <div class="command-toolbar"><button type="button" class="text-button" data-resource="fish_audio">Получить API-ключ ↗</button><button type="button" class="text-button" data-resource="fish_voices">Найти голос ↗</button></div>
+  </div>
   <div class="form-grid"><label class="field">Громкость голоса <output id="voice-volume-value"></output><input id="tts_volume" type="range" min="0" max="100" step="1"/><small>Отдельно от громкости музыки и Windows.</small></label><label class="field">Скорость <output id="voice-rate-value"></output><input id="tts_rate" type="range" min="-10" max="10" step="1"/></label></div>
-  <div class="form-grid"><label class="field">Пресет<select id="voice-preset"><option value="">Выберите пресет</option><option value="calm">Спокойный · медленнее</option><option value="normal">Обычный</option><option value="bright">Энергичный · быстрее</option>${settings.voice_presets.map((p,i)=>`<option value="custom-${i}">${esc(p.name)}</option>`).join('')}</select></label><label class="field">Имя своего пресета<input id="voice-preset-name" placeholder="Например: Вася — Дмитрий"/></label></div><div class="command-toolbar"><button id="test-voice" class="secondary" type="button">Послушать голос</button><button id="save-voice-preset" class="text-button" type="button">Добавить свой пресет</button><button id="delete-voice-preset" class="text-button" type="button">Удалить выбранный</button></div></section>`;
+  <div class="form-grid"><label class="field">Пресет<select id="voice-preset"><option value="">Выберите пресет</option><option value="calm">Спокойный · медленнее</option><option value="normal">Обычный</option><option value="bright">Энергичный · быстрее</option>${settings.voice_presets.map((p,i)=>`<option value="custom-${i}">${esc(p.name)}</option>`).join('')}</select></label><label class="field">Имя своего пресета<input id="voice-preset-name" placeholder="Например: Вася — Дмитрий"/></label></div><div class="command-toolbar"><button id="test-voice" class="secondary" type="button">Послушать голос</button><button id="save-voice-preset" class="text-button" type="button">Добавить свой пресет</button><button id="delete-voice-preset" class="text-button" type="button">Удалить выбранный</button></div><p id="voice-test-status" class="form-note" role="status"></p></section>`;
 }
 function bindVoiceForm(){
- const update=()=>{const piper=($('tts_engine') as HTMLSelectElement).value==='piper';$('piper-voice').hidden=!piper;$('windows-voice').hidden=piper;$('voice-volume-value').textContent=($('tts_volume') as HTMLInputElement).value+'%';$('voice-rate-value').textContent=($('tts_rate') as HTMLInputElement).value;};
+ const update = () => {
+   const engine = ($('tts_engine') as HTMLSelectElement).value;
+   $('piper-voice').hidden = engine !== 'piper';
+   $('windows-voice').hidden = engine !== 'windows';
+   $('fish-voice').hidden = engine !== 'fish_audio';
+   $('voice-volume-value').textContent = ($('tts_volume') as HTMLInputElement).value + '%';
+   $('voice-rate-value').textContent = ($('tts_rate') as HTMLInputElement).value;
+ };
+ const keyInput = $('fish-api-key') as HTMLInputElement;
+ const keyStatus = $('fish-key-status');
+ keyStatus.textContent = fishKeySet ? 'Ключ Fish Audio сохранён.' : 'Ключ Fish Audio ещё не сохранён.';
+ const storeFishKey = async (key: string) => {
+   if (!native) { toast('Ключ хранится в Windows-приложении.'); return; }
+   try {
+     await invoke('save_api_key', {provider: 'fish_audio', key});
+     fishKeySet = !!key;
+     keyInput.value = '';
+     keyStatus.textContent = fishKeySet ? 'Ключ Fish Audio сохранён.' : 'Ключ Fish Audio удалён.';
+   } catch (e) {
+     keyStatus.textContent = String(e);
+   }
+ };
+ $('save-fish-key').onclick = () => {
+   const key = keyInput.value.trim();
+   if (!key) { keyStatus.textContent = 'Введите API-ключ Fish Audio.'; return; }
+   void storeFishKey(key);
+ };
+ keyInput.onkeydown = event => {
+   if (event.key === 'Enter') {
+     event.preventDefault();
+     $('save-fish-key').click();
+   }
+ };
+ $('delete-fish-key').onclick = () => { void storeFishKey(''); };
  $('tts_engine').onchange=update;$('tts_volume').oninput=update;$('tts_rate').oninput=update;
- $('test-voice').onclick=()=>{void call('test_voice',{settings:readForm()});};
+ $('test-voice').onclick = async () => {
+   if (!native) { await call('test_voice'); return; }
+   const status = $('voice-test-status');
+   status.textContent = 'Проверяю голос…';
+   try { await invoke('test_voice', {settings: readForm()}); }
+   catch (e) { status.textContent = String(e); }
+ };
  const refreshPresets=()=>{const select=$('voice-preset') as HTMLSelectElement;select.querySelectorAll('option[value^="custom-"]').forEach(o=>o.remove());settings.voice_presets.forEach((p,i)=>select.add(new Option(p.name,'custom-'+i)));};
  $('voice-preset').onchange=()=>{const value=($('voice-preset') as HTMLSelectElement).value;if(!value)return;
   if(!value.startsWith('custom-')){($('tts_rate') as HTMLInputElement).value=String({calm:-2,normal:0,bright:2}[value as 'calm'|'normal'|'bright']);update();return;}
   const preset=settings.voice_presets[Number(value.slice(7))];if(!preset)return;
-  for(const [id,v]of Object.entries({tts_engine:preset.engine,tts_voice:preset.voice,piper_model:preset.model,piper_speaker:preset.speaker,tts_rate:preset.rate})){const input=$(id) as HTMLInputElement;input.value=String(v);}update();
+  for(const [id,v]of Object.entries({tts_engine:preset.engine,tts_voice:preset.voice,piper_model:preset.model,piper_speaker:preset.speaker,tts_rate:preset.rate,fish_voice:preset.fish_voice,fish_model:preset.fish_model})){const input=$(id) as HTMLInputElement;input.value=String(v);}update();
  };
- $('save-voice-preset').onclick=()=>{const name=($('voice-preset-name') as HTMLInputElement).value.trim();if(!name){toast('Введите имя пресета.');return;}const next=readForm();settings.voice_presets=[...settings.voice_presets.filter(p=>p.name!==name),{name,engine:next.tts_engine,voice:next.tts_voice,model:next.piper_model,speaker:next.piper_speaker,rate:next.tts_rate}];refreshPresets();toast('Пресет добавлен. Нажмите «Сохранить настройки».');};
+ $('save-voice-preset').onclick = () => {
+   const name = ($('voice-preset-name') as HTMLInputElement).value.trim();
+   if (!name) { toast('Введите имя пресета.'); return; }
+   const next = readForm();
+   if (next.tts_engine === 'fish_audio' && !next.fish_voice) {
+     toast('Укажите ID или ссылку на голос Fish Audio.');
+     return;
+   }
+   settings.voice_presets = [...settings.voice_presets.filter(p => p.name !== name), {
+     name, engine: next.tts_engine, voice: next.tts_voice, model: next.piper_model,
+     speaker: next.piper_speaker, rate: next.tts_rate, fish_voice: next.fish_voice, fish_model: next.fish_model,
+   }];
+   refreshPresets();
+   toast('Пресет добавлен. Нажмите «Сохранить настройки».');
+ };
  $('delete-voice-preset').onclick=()=>{const value=($('voice-preset') as HTMLSelectElement).value;if(value.startsWith('custom-')){settings.voice_presets.splice(Number(value.slice(7)),1);refreshPresets();toast('Пресет удалён. Сохраните настройки.');}};
  update();
  const model=$('llm_model') as HTMLInputElement;model.setAttribute('list','model-options');model.insertAdjacentHTML('afterend','<datalist id="model-options"></datalist>');
@@ -390,6 +477,7 @@ function settingsForm() {
     <div class="field"><label for="microphone">Микрофон</label><div class="input-row"><select id="microphone"></select><button type="button" id="refresh-mics" class="secondary small">Обновить</button></div></div>
     <div class="form-grid"><label class="field">Способ активации<select id="activation"><option value="both">Слово и горячая клавиша</option><option value="wake">Только слово</option><option value="hotkey">Только горячая клавиша</option></select></label>${field('hotkey', 'Горячая клавиша', 'Например: Ctrl+Alt+Space')}</div>
     <div class="form-grid">${field('wake_words', 'Слова активации', 'Несколько вариантов через запятую')}${field('command_timeout', 'Ожидание команды, секунд', 'После слова или нажатия клавиши', 'number')}</div>
+    ${field('wake_aliases', 'Варианты вызова из калибровки', 'Через запятую. Удалите обычные слова, если Вася реагирует на них в разговоре.')}
     <div class="check-grid"><label><input type="checkbox" id="voice_feedback"/> Голосовое подтверждение</label><label><input type="checkbox" id="island_enabled"/> Показывать панель активации поверх окон</label><label><input type="checkbox" id="start_muted"/> Запускать с выключенным микрофоном</label><label><input type="checkbox" id="start_in_tray"/> Открывать сразу в трее</label></div></section>
     <section class="settings-card"><div class="card-title">${icon('shield')}<h2>Распознавание речи</h2><span class="tag">Локально</span></div>
     <label class="field">Режим<select id="speech_mode"><option value="vosk">Vosk — быстрые команды и диктовка</option><option value="whisper">Vosk + Whisper — уточнение активированных фраз</option></select></label>
@@ -401,15 +489,20 @@ function settingsForm() {
     ${field('vosk_library', 'Библиотека Vosk', 'Оставьте пустым для встроенной библиотеки')}${field('vosk_model', 'Папка модели Vosk', 'Оставьте пустым для встроенной русской модели')}
     </details>
     <div id="whisper-fields"><details><summary>Дополнительно: свой Whisper</summary>${field('whisper_executable', 'Путь к whisper-cli.exe','Пусто — встроенный Whisper')}${field('whisper_model', 'Файл модели Whisper', 'Пусто — встроенная многоязычная base; можно указать другую модель whisper.cpp')}</details></div>
-    <p class="form-note">Вызов распознаётся Vosk, затем Whisper уточняет активированную фразу с учётом выбранного языка.</p></section>
+    <label class="check-grid"><span><input id="llm_repair_speech" type="checkbox"/> Восстанавливать неуверенно распознанные команды с помощью модели</span></label>
+    <p class="form-note">Модель получает текстовые варианты распознавания команды. При неоднозначности Вася попросит повторить фразу.</p></section>
     ${voiceForm()}
     <section class="settings-card"><div class="card-title">${icon('music')}<h2>Музыка и браузер</h2></div><div class="form-grid"><label class="field">Основной сервис<select id="music_service"><option value="yandex">Яндекс Музыка</option><option value="youtube">YouTube</option><option value="spotify">Spotify</option></select></label><label class="field">Браузер музыкального профиля<select id="browser"><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option></select></label></div>
     <label class="field">Где запускать музыку<select id="music_mode"><option value="desktop">В установленном приложении</option><option value="browser">В отдельном музыкальном профиле браузера</option></select></label>
     <details><summary>Пути к музыкальным приложениям</summary>${field('yandex_app_path','Приложение Яндекс Музыки','Пусто — найти автоматически в LocalAppData\\Programs\\YandexMusic')}${field('spotify_app_path','Приложение Spotify','Пусто — найти автоматически или использовать протокол Spotify')}</details>
-    <div class="command-toolbar"><button id="login" type="button" class="secondary">Подключить музыкальный сервис ${icon('arrow',16)}</button><button id="restart-music" type="button" class="secondary">Перезапустить и подключить Яндекс Музыку</button></div><p class="form-note">Сначала сохраните выбранный сервис и путь. Перезапуск остановит текущую музыку и включит управление официальным клиентом. В дальнейшем Вася восстановит подключение автоматически. Пример: «включи трек Перемен исполнителя Кино». В Spotify пока требуется выбрать результат вручную.</p></section>
+    <div class="command-toolbar"><button id="login" type="button" class="secondary">Открыть музыкальный сервис ${icon('arrow',16)}</button><button id="restart-music" type="button" class="secondary">Перезапустить и подключить Яндекс Музыку</button></div><p class="form-note">Сначала сохраните выбранный сервис и путь. Перезапуск остановит текущую музыку. После подключения скажите «Вась, включи исполнителя Кино». В Spotify результат нужно выбрать вручную.</p></section>
+    <section class="settings-card"><div class="card-title">${icon('search')}<h2>Веб-поиск с ответом</h2></div>
+    ${field('web_search_url', 'Адрес своего SearXNG', 'Пустое поле включает DuckDuckGo. Для SearXNG нужна выдача в формате JSON.')}
+    <p class="form-note">Поисковый сервис получает текст запроса. Выбранная модель составляет ответ по выдержкам, а Вася добавляет ссылки на источники.</p></section>
     <section class="settings-card"><div class="card-title">${icon('key')}<h2>Модель и ответы</h2></div><label class="field">Провайдер<select id="llm_provider"><option value="lm_studio">LM Studio · локально</option><option value="ollama">Ollama · локально</option><option value="open_router">OpenRouter · облако</option><option value="open_ai">OpenAI API · облако</option><option value="compatible">Другой совместимый API</option></select></label><div class="form-grid">${field('llm_url','Базовый адрес API','Например: https://openrouter.ai/api/v1')}${field('llm_model','Идентификатор модели')}</div>
     <div class="api-key-row"><label class="field">API-ключ<input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Ключ не отображается после сохранения"/></label><button type="button" class="secondary" id="save-api-key">Сохранить ключ</button><button type="button" class="text-button" id="delete-api-key">Удалить ключ</button></div><p id="api-key-status" class="form-note"></p><button type="button" id="get-api-key" class="text-button">Получить API-ключ у провайдера ↗</button>
-    <div class="check-grid"><label><input id="llm_fallback" type="checkbox"/> Обращаться к модели, если команда не распознана</label><label><input id="llm_structured" type="checkbox"/> Структурированные ответы JSON · модель должна их поддерживать</label></div><button id="check-llm" type="button" class="secondary">Проверить соединение и модели ${icon('arrow',16)}</button><p id="llm-models" class="form-note"></p><p class="form-note">В облако отправляется текст запроса; распознавание аудио остаётся локальным. API-ключ защищён Windows и хранится отдельно от settings.json. Подписка ChatGPT не заменяет API-ключ: API имеет отдельный учёт, у некоторых тарифов доступны API-кредиты. Ответы раскрываются из панели Васи; их можно закрыть кнопкой × или Escape.</p></section>
+    <label class="field">Характер Васи<select id="llm_style"><option value="neutral">Нейтральный</option><option value="casual">Разговорный · с юмором</option><option value="bold">Дерзкий · мат по ситуации</option></select><small>Стиль действует в разговоре. Возможность использовать мат зависит от выбранной модели.</small></label>
+    <div class="check-grid"><label><input id="llm_fallback" type="checkbox"/> Обращаться к модели для разговора и незнакомых команд</label><label><input id="llm_structured" type="checkbox"/> Структурированные ответы JSON · модель должна их поддерживать</label></div><button id="check-llm" type="button" class="secondary">Проверить соединение и модели ${icon('arrow',16)}</button><p id="llm-models" class="form-note"></p><p class="form-note">При разговоре модель получает текущую реплику и недавний диалог. Диалог хранится в памяти до выхода из Васи. Чтобы начать с чистого контекста, нажмите «Новый разговор» на вкладке «Помощник».</p><p class="form-note">Распознавание аудио остаётся локальным. API-ключ защищён Windows и хранится отдельно от settings.json. Подписка ChatGPT не заменяет API-ключ: API имеет отдельный учёт, у некоторых тарифов доступны API-кредиты.</p></section>
     <div class="save-row"><span>Настройки применятся после сохранения.</span><button type="submit" class="primary">Сохранить настройки ${icon('arrow', 17)}</button></div></form>`;
 }
 function fillDevices() {
@@ -435,7 +528,7 @@ function readForm(): Settings {
     const element = document.getElementById(key) as HTMLInputElement | HTMLSelectElement | null;
     if (!element) continue;
     (next as Record<string, unknown>)[key] = typeof value === 'boolean' ? (element as HTMLInputElement).checked
-      : typeof value === 'number' ? Number(element.value) : key === 'wake_words'
+      : typeof value === 'number' ? Number(element.value) : key === 'wake_words' || key === 'wake_aliases'
       ? element.value.split(',').map(w => w.trim().toLowerCase()).filter(Boolean) : element.value.trim();
   }
   for(const key of ['vosk_library','vosk_model','whisper_executable','whisper_model','yandex_app_path','spotify_app_path','piper_executable','piper_model'] as const) next[key]=next[key].replace(/^"(.*)"$/,'$1');
@@ -467,13 +560,19 @@ async function connect() {
     }
     if (event.kind === 'status') { status = event.text; updateStatus(); }
     if (event.kind === 'microphone') { muted = event.text === 'muted'; updateStatus(); }
+    if (event.kind === 'voice_test') {
+      const voiceStatus = document.getElementById('voice-test-status');
+      if (voiceStatus) voiceStatus.textContent = event.text;
+    }
     if (event.kind === 'heard') { heard = event.text; log('heard', `Вы: ${heard}`); }
     if (event.kind === 'info') { log('info', event.text); toast(event.text); }
     if (event.kind === 'error') { error = event.text; showError(); log('error', error); }
+    if (event.kind === 'clear_error') { error = ''; showError(); }
     if (event.kind === 'result') {
       result = event.text;
+      previewResult = true;
       const panel = document.getElementById('result-panel');
-      if (panel) { panel.hidden = false; ($('result') as HTMLTextAreaElement).value = result; }
+      if (panel) displayResult();
       else toast('Текст готов. Результат доступен на вкладке «Помощник».');
     }
   });
@@ -482,7 +581,7 @@ async function connect() {
     connected=true;
     speechReady = initial.speech_ready; settings = initial.settings; muted = initial.muted; busy = initial.busy; captureOpen = initial.capture_open;
     status = initial.status; dataDirectory = initial.data_directory;
-    keySet=initial.llm_key_set;result=initial.last_result||result;
+    keySet=initial.llm_key_set; fishKeySet=initial.fish_key_set; result=initial.last_result||result;
     error = [...initial.errors, ...(initial.last_error ? [initial.last_error] : [])].join('\n');
     render();
   }

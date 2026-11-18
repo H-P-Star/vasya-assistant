@@ -26,6 +26,8 @@
     "allow-test-voice",
     "allow-restart-music-app",
     "allow-cancel-current",
+    "allow-clear-conversation",
+    "allow-open-answer-link",
     "allow-open-resource"
   ]
 }

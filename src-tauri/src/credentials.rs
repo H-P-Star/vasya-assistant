@@ -10,6 +10,7 @@ fn path(provider: &str) -> Result<std::path::PathBuf> {
         "open_router",
         "open_ai",
         "compatible",
+        "fish_audio",
     ]
     .contains(&provider)
     {

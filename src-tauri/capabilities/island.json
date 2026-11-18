@@ -11,6 +11,7 @@
     "allow-dismiss-island",
     "allow-expand-island",
     "allow-copy-result",
+    "allow-open-answer-link",
     "allow-show-main"
   ]
 }

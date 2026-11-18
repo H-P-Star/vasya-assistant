@@ -51,11 +51,19 @@ pub struct Shared {
     pub last_status: RwLock<String>,
     pub last_error: RwLock<Option<String>>,
     pub last_result: RwLock<String>,
+    dialogue: Mutex<Vec<crate::generator::DialogueTurn>>,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
     pub platform: Arc<dyn Platform>,
 }
 
 impl Shared {
+    pub fn clear_conversation(&self) {
+        let mut dialogue = self.dialogue.lock().unwrap();
+        self.epoch.fetch_add(1, SeqCst);
+        self.activate.store(false, SeqCst);
+        dialogue.clear();
+    }
+
     pub fn emit(&self, kind: &str, text: impl Into<String>) {
         let text = text.into();
         if kind == "status" {
@@ -63,6 +71,9 @@ impl Shared {
         }
         if kind == "error" {
             *self.last_error.write().unwrap() = Some(text.clone());
+        }
+        if kind == "clear_error" {
+            *self.last_error.write().unwrap() = None;
         }
         if kind == "result" {
             *self.last_result.write().unwrap() = text.clone();
@@ -126,6 +137,7 @@ pub enum Task {
         samples: Option<Vec<i16>>,
         had_wake: bool,
         dictating: bool,
+        uncertain: bool,
     },
     Login,
     TestVoice(Box<Settings>),
@@ -177,6 +189,7 @@ impl Runtime {
             last_status: RwLock::new("Запускаю помощника".into()),
             last_error: RwLock::new(None),
             last_result: RwLock::new(String::new()),
+            dialogue: Mutex::new(Vec::new()),
         });
         let (sender, receiver) = mpsc::sync_channel(4);
         let browser_process = Arc::new(Mutex::new(browser::BrowserProcess::default()));
@@ -200,6 +213,9 @@ impl Runtime {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     let confirmation_epoch = state.epoch.load(SeqCst);
+                    if matches!(&task, Task::Login | Task::RestartMusic) {
+                        state.emit("clear_error", "");
+                    }
                     match execute(&state, &mut music, task) {
                         Ok(message) => {
                             state.emit("info", &message);
@@ -274,7 +290,14 @@ impl Runtime {
         self.shared.epoch.fetch_add(1, SeqCst);
         self.shared.dictating.store(false, SeqCst);
         *self.shared.last_error.write().unwrap() = None;
-        *self.shared.settings.write().unwrap() = settings;
+        let mut current = self.shared.settings.write().unwrap();
+        if current.llm_provider != settings.llm_provider
+            || current.llm_url != settings.llm_url
+            || current.llm_model != settings.llm_model
+        {
+            self.shared.dialogue.lock().unwrap().clear();
+        }
+        *current = settings;
         self.shared.config_version.fetch_add(1, SeqCst);
     }
     pub fn close(&self) {
@@ -303,10 +326,88 @@ fn insert_if_current(
     state.platform.insert(text, target)
 }
 
+fn same_words(left: &str, right: &str) -> bool {
+    let normalize = |text: &str| {
+        text.to_lowercase()
+            .replace('ё', "е")
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    normalize(left) == normalize(right)
+}
+
+fn repair_allowed(fixed: &Command, vosk: &Command, whisper: Option<&Command>) -> bool {
+    use std::mem::discriminant;
+    let recognized = |command: &Command| !matches!(command, Command::Unknown(_));
+    if whisper.is_some_and(|command| {
+        recognized(vosk)
+            && recognized(command)
+            && (discriminant(vosk) != discriminant(command)
+                || (commands::time_sensitive(vosk) && vosk != command))
+    }) {
+        return false;
+    }
+    if matches!(fixed, Command::Insert(_) | Command::LaunchApp(_))
+        || commands::time_sensitive(fixed)
+    {
+        return fixed == vosk || whisper == Some(fixed);
+    }
+    let fixed_kind = discriminant(fixed);
+    let recognized_kind = [Some(vosk), whisper]
+        .into_iter()
+        .flatten()
+        .filter(|command| recognized(command))
+        .map(discriminant)
+        .next();
+    recognized_kind.map_or_else(
+        || {
+            !matches!(
+                fixed,
+                Command::OpenMusic(_) | Command::WebAnswer(_) | Command::Generate(_)
+            )
+        },
+        |kind| kind == fixed_kind,
+    )
+}
+
+fn present_answer(
+    state: &Shared,
+    settings: &Settings,
+    question: &str,
+    answer: &str,
+    spoken: &str,
+    epoch: u64,
+) -> Result<String> {
+    {
+        let mut history = state.dialogue.lock().unwrap();
+        if state.cancelled(epoch) {
+            bail!("Команда отменена");
+        }
+        if history.len() >= 6 {
+            history.remove(0);
+        }
+        history.push(crate::generator::DialogueTurn {
+            question: question.chars().take(400).collect(),
+            answer: answer.chars().take(1000).collect(),
+        });
+    }
+    state.emit("result", answer);
+    state.emit("answer", answer);
+    if settings.voice_feedback && !state.capture_open.load(SeqCst) && !state.cancelled(epoch) {
+        let brief: String = spoken.chars().take(1200).collect();
+        state
+            .platform
+            .speak_configured(&brief, settings, &|| state.cancelled(epoch))?;
+    }
+    Ok("Ответ сохранён".into())
+}
+
 fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Result<String> {
     let settings =
         crate::config::resolve_speech(&state.snapshot(), &state.resources.read().unwrap());
-    let (text, target, epoch, preview, dictating) = match task {
+    let (text, target, epoch, preview, dictating, repair_evidence) = match task {
         Task::RestartMusic => {
             let settings = Settings {
                 music_service: "yandex".into(),
@@ -317,15 +418,30 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
                 .ok_or_else(|| anyhow::anyhow!("Не найдено приложение Яндекс Музыки"))?;
             state.platform.stop_app(&exe.to_string_lossy())?;
             std::thread::sleep(std::time::Duration::from_millis(700));
-            return music.login(&settings);
+            return music.reconnect_yandex(&settings);
         }
         Task::TestVoice(settings) => {
+            if settings.tts_volume == 0 {
+                let message =
+                    "Громкость голоса установлена на 0%. Поднимите её и повторите проверку.";
+                state.emit("voice_test", message);
+                bail!("{message}");
+            }
             let epoch = state.epoch.load(SeqCst);
-            state.platform.speak_configured(
+            let result = state.platform.speak_configured(
                 "Привет! Я Вася. Так звучит выбранный голос.",
                 &settings,
                 &|| state.cancelled(epoch),
-            )?;
+            );
+            if let Err(error) = result {
+                state.emit("voice_test", format!("{error:#}"));
+                return Err(error);
+            }
+            if state.cancelled(epoch) {
+                state.emit("voice_test", "Проверка голоса отменена.");
+                bail!("Проверка голоса отменена");
+            }
+            state.emit("voice_test", "Проверка голоса завершена.");
             return Ok("Проверка голоса завершена".into());
         }
         Task::Login => return music.login(&settings),
@@ -338,55 +454,164 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
             return Ok("Текст вставлен".into());
         }
         Task::Text {
-            mut text,
+            text,
             target,
             epoch,
             preview,
             samples,
             had_wake,
             dictating,
+            uncertain,
         } => {
             if state.cancelled(epoch) {
                 bail!("Команда отменена");
             }
-            if let Some(samples) = samples.filter(|_| {
-                !commands::time_sensitive(&commands::parse_with_settings(
-                    &text, dictating, &settings,
-                ))
-            }) {
-                let refined = crate::speech::whisper_configured(&settings, &samples, || {
-                    state.cancelled(epoch)
-                })?;
-                text = if had_wake {
-                    crate::activation::detected_body(
-                        &refined,
-                        &crate::activation::all_wake_words(&settings),
-                    )
-                    .to_string()
-                } else {
-                    refined
-                };
+            let text = crate::calibration::correct(&text, &settings.speech_corrections);
+            let original = commands::parse_with_settings(&text, dictating, &settings);
+            let repair_enabled = !preview
+                && !dictating
+                && settings.llm_repair_speech
+                && !matches!(
+                    original,
+                    Command::Disabled | Command::Invalid(_) | Command::Insert(_)
+                );
+            let refined = samples
+                .filter(|_| !commands::time_sensitive(&original) || (repair_enabled && uncertain))
+                .and_then(|samples| {
+                    let refined = crate::speech::whisper_configured(&settings, &samples, || {
+                        state.cancelled(epoch)
+                    })
+                    .ok()?;
+                    let refined = if had_wake {
+                        crate::activation::detected_body(
+                            &refined,
+                            &crate::activation::all_wake_words(&settings),
+                        )
+                        .to_owned()
+                    } else {
+                        refined
+                    };
+                    let refined =
+                        crate::calibration::correct(&refined, &settings.speech_corrections);
+                    if matches!(original, Command::Insert(_))
+                        && !matches!(
+                            commands::parse_with_settings(&refined, dictating, &settings),
+                            Command::Insert(_)
+                        )
+                    {
+                        return None;
+                    }
+                    (!refined.trim().is_empty()).then_some(refined)
+                });
+            let disagreement = refined
+                .as_deref()
+                .is_some_and(|other| !same_words(&text, other));
+            if repair_enabled && (uncertain || disagreement) {
+                let second = refined
+                    .as_ref()
+                    .map(|other| commands::parse_with_settings(other, false, &settings));
+                if matches!(second, Some(Command::Insert(_))) {
+                    return present_answer(
+                        state,
+                        &settings,
+                        &text,
+                        "Я не уверен, что расслышал просьбу о вставке текста. Повтори, пожалуйста.",
+                        "Повтори, пожалуйста.",
+                        epoch,
+                    );
+                }
+                state.emit("status", "Уточняю распознавание…");
+                let repaired =
+                    crate::generator::repair_speech(&settings, &text, refined.as_deref(), || {
+                        state.cancelled(epoch)
+                    });
+                if state.cancelled(epoch) {
+                    bail!("Команда отменена");
+                }
+                match repaired {
+                    Ok(Some(candidate))
+                        if repair_allowed(
+                            &commands::parse_with_settings(&candidate, false, &settings),
+                            &original,
+                            second.as_ref(),
+                        ) =>
+                    {
+                        (
+                            candidate,
+                            target,
+                            epoch,
+                            preview,
+                            dictating,
+                            Some((original, second)),
+                        )
+                    }
+                    Err(_) if !disagreement && !matches!(original, Command::Unknown(_)) => (
+                        refined.unwrap_or(text),
+                        target,
+                        epoch,
+                        preview,
+                        dictating,
+                        None,
+                    ),
+                    _ => {
+                        let message =
+                            "Я не уверен, что правильно расслышал. Повтори запрос, пожалуйста.";
+                        return present_answer(state, &settings, &text, message, message, epoch);
+                    }
+                }
+            } else {
+                (
+                    refined.unwrap_or(text),
+                    target,
+                    epoch,
+                    preview,
+                    dictating,
+                    None,
+                )
             }
-            (text, target, epoch, preview, dictating)
         }
     };
     if state.cancelled(epoch) {
         bail!("Команда отменена");
     }
-    let text = crate::calibration::correct(&text, &settings.speech_corrections);
     state.emit("heard", &text);
     state.emit("status", "Выполняю команду");
     let mut command = commands::parse_with_settings(&text, dictating, &settings);
     if matches!(command, Command::Unknown(_)) && settings.llm_fallback {
         state.emit("status", "Обращаюсь к модели…");
-        command = crate::generator::resolve(&settings, &text, || state.cancelled(epoch))?;
+        let history = state.dialogue.lock().unwrap().clone();
+        command = crate::generator::resolve_with_history(&settings, &text, &history, || {
+            state.cancelled(epoch)
+        })?;
         if state.cancelled(epoch) {
             bail!("Команда отменена");
+        }
+        if let Some((original, second)) = &repair_evidence {
+            if !matches!(command, Command::Answer(_))
+                && !repair_allowed(&command, original, second.as_ref())
+            {
+                let message = "Я не уверен, что правильно расслышал. Повтори запрос, пожалуйста.";
+                return present_answer(state, &settings, &text, message, message, epoch);
+            }
         }
         state.emit("status", "Выполняю команду");
     }
     match command {
         Command::Search(query) => { browser::open_external(&browser::search_url(&query))?; Ok("Открыт поиск в браузере".into()) }
+        Command::WebAnswer(query) => {
+            state.emit("status", "Ищу в интернете…");
+            let sources = crate::web_search::sources(&query, &settings.web_search_url, &|| state.cancelled(epoch))?;
+            state.emit("status", "Сверяю источники…");
+            let summary = match crate::generator::research_answer(&settings, &query, &sources, || state.cancelled(epoch)) {
+                Ok(answer) => answer,
+                Err(error) if !state.cancelled(epoch) => {
+                    format!("Нашёл источники. Составить ответ не удалось. {error}")
+                }
+                Err(error) => return Err(error),
+            };
+            let answer = crate::web_search::with_links(&summary, &sources);
+            present_answer(state, &settings, &text, &answer, &summary, epoch)
+        }
         Command::Youtube(query) => browser::youtube(&query),
         Command::Music { query, category } => music.play_with_cancel(&settings, &query, &category,&||state.cancelled(epoch)),
         Command::OpenMusic(service) => music.login(&Settings { music_service: service, ..settings }),
@@ -418,15 +643,7 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
         Command::DictationStop => { state.dictating.store(false, SeqCst); Ok("Диктовка завершена".into()) }
         Command::Mute => { state.set_muted(true); Ok("Микрофон отключён".into()) }
         Command::Cancel => { state.dictating.store(false, SeqCst); Ok("Отменено".into()) }
-        Command::Answer(answer) => {
-            state.emit("result", &answer);
-            state.emit("answer", &answer);
-            if settings.voice_feedback && !state.capture_open.load(SeqCst) && !state.cancelled(epoch) {
-                let brief: String = answer.chars().take(1200).collect();
-                state.platform.speak_configured(&brief, &settings, &|| state.cancelled(epoch))?;
-            }
-            Ok("Ответ сохранён".into())
-        }
+        Command::Answer(answer) => present_answer(state, &settings, &text, &answer, &answer, epoch),
         Command::LaunchApp(path) => { state.platform.launch_app(&path)?; Ok("Приложение открыто".into()) }
         Command::Disabled => Ok("Эта команда отключена в настройках".into()),
         Command::Invalid(reason) => bail!("{reason}"),
@@ -436,10 +653,14 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
 
 pub trait MusicServiceExt: MusicService {
     fn login(&mut self, settings: &Settings) -> Result<String>;
+    fn reconnect_yandex(&mut self, settings: &Settings) -> Result<String>;
 }
 impl MusicServiceExt for BrowserMusic {
     fn login(&mut self, settings: &Settings) -> Result<String> {
         BrowserMusic::login(self, settings)
+    }
+    fn reconnect_yandex(&mut self, settings: &Settings) -> Result<String> {
+        BrowserMusic::reconnect_yandex(self, settings)
     }
 }
 
@@ -481,6 +702,9 @@ mod tests {
         fn login(&mut self, _: &Settings) -> Result<String> {
             panic!("No login expected")
         }
+        fn reconnect_yandex(&mut self, _: &Settings) -> Result<String> {
+            panic!("No reconnect expected")
+        }
     }
     fn text_task(text: &str) -> Task {
         Task::Text {
@@ -491,6 +715,7 @@ mod tests {
             samples: None,
             had_wake: false,
             dictating: false,
+            uncertain: false,
         }
     }
     #[test]
@@ -557,12 +782,19 @@ mod tests {
             assert!(platform.inserted.lock().unwrap().is_empty());
             if plan.contains("pause") {
                 assert_eq!(*platform.media_actions.lock().unwrap(), vec!["pause"]);
+                assert!(runtime.shared.dialogue.lock().unwrap().is_empty());
             } else {
                 assert!(events
                     .lock()
                     .unwrap()
                     .iter()
                     .any(|e| e.kind == "result" && e.text == "IPv6 — протокол."));
+                let dialogue = runtime.shared.dialogue.lock().unwrap().clone();
+                assert_eq!(dialogue.len(), 1);
+                assert_eq!(dialogue[0].question, "пожалуйста сделай как я попросил");
+                assert_eq!(dialogue[0].answer, "IPv6 — протокол.");
+                runtime.shared.clear_conversation();
+                assert!(runtime.shared.dialogue.lock().unwrap().is_empty());
             }
             runtime.close();
         }
@@ -609,10 +841,32 @@ mod tests {
             samples: Some(vec![0; 1600]),
             had_wake: false,
             dictating: false,
+            uncertain: false,
         };
         execute(&runtime.shared, &mut UnusedMusic, task).unwrap();
         assert_eq!(*platform.media_actions.lock().unwrap(), vec!["pause"]);
         runtime.close();
+    }
+    #[test]
+    fn repair_allows_track_spelling_but_rejects_conflicting_volume_or_invented_insertion() {
+        let settings = Settings::default();
+        let parse = |text| commands::parse_with_settings(text, false, &settings);
+        assert!(same_words("Что такое IPv6?", "что такое IPv6"));
+        assert!(repair_allowed(
+            &parse("включи трек Numb исполнителя Linkin Park"),
+            &parse("включи трек намб исполнителя линкин парк"),
+            Some(&parse("включи трек Numb исполнителя Linkin Park")),
+        ));
+        assert!(!repair_allowed(
+            &Command::Volume(20),
+            &Command::Volume(20),
+            Some(&Command::Volume(90))
+        ));
+        assert!(!repair_allowed(
+            &Command::Insert("текст".into()),
+            &Command::Unknown("шум".into()),
+            None
+        ));
     }
     #[test]
     fn first_run_cannot_enable_background_capture_before_completion() {

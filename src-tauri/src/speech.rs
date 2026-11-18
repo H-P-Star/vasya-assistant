@@ -14,6 +14,7 @@ type Text = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type Reset = unsafe extern "C" fn(*mut c_void);
 type NewGrammar = unsafe extern "C" fn(*mut c_void, f32, *const c_char) -> *mut c_void;
 type FindWord = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
+type SetWords = unsafe extern "C" fn(*mut c_void, c_int);
 
 fn model_path_cstring(model: &Path) -> Result<CString> {
     // Tauri canonicalizes the executable path; Windows then adds a \\?\ prefix.
@@ -57,7 +58,6 @@ pub struct Vosk {
     free_recognizer: Free,
     accept: Accept,
     result: Text,
-    partial_result: Text,
     final_result: Text,
     wake_recognizer: Option<NonNull<c_void>>,
     reset: Reset,
@@ -91,7 +91,6 @@ impl Vosk {
             let free_recognizer: Free = *lib.get(b"vosk_recognizer_free\0")?;
             let accept: Accept = *lib.get(b"vosk_recognizer_accept_waveform_s\0")?;
             let result: Text = *lib.get(b"vosk_recognizer_result\0")?;
-            let partial_result: Text = *lib.get(b"vosk_recognizer_partial_result\0")?;
             let final_result: Text = *lib.get(b"vosk_recognizer_final_result\0")?;
             let reset: Reset = *lib.get(b"vosk_recognizer_reset\0")?;
             let set_log: unsafe extern "C" fn(c_int) = *lib.get(b"vosk_set_log_level\0")?;
@@ -110,7 +109,6 @@ impl Vosk {
                 free_recognizer,
                 accept,
                 result,
-                partial_result,
                 final_result,
                 wake_recognizer: None,
                 reset,
@@ -119,6 +117,21 @@ impl Vosk {
     }
 
     pub fn accept(&mut self, samples: &[i16]) -> Result<Option<String>> {
+        Ok(self.accept_transcript(samples)?.map(|(text, _)| text))
+    }
+
+    pub fn enable_word_confidence(&mut self) {
+        unsafe {
+            if let Ok(set_words) = self
+                ._library
+                .get::<SetWords>(b"vosk_recognizer_set_words\0")
+            {
+                set_words(self.recognizer.as_ptr(), 1);
+            }
+        }
+    }
+
+    pub fn accept_transcript(&mut self, samples: &[i16]) -> Result<Option<(String, Vec<f64>)>> {
         // SAFETY: Both buffers and recognizer are valid for this synchronous call.
         let status = unsafe {
             (self.accept)(
@@ -139,7 +152,19 @@ impl Vosk {
         }
         let json: serde_json::Value =
             serde_json::from_slice(unsafe { CStr::from_ptr(ptr) }.to_bytes())?;
-        Ok(Some(json["text"].as_str().unwrap_or_default().into()))
+        let confidence = json["result"]
+            .as_array()
+            .map(|words| {
+                words
+                    .iter()
+                    .map(|word| word["conf"].as_f64().unwrap_or(1.0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some((
+            json["text"].as_str().unwrap_or_default().into(),
+            confidence,
+        )))
     }
 
     pub fn reset(&mut self) {
@@ -181,50 +206,35 @@ impl Vosk {
         }
     }
 
-    pub fn wake(&mut self, samples: &[i16]) -> Result<String> {
+    pub fn feed_wake(&mut self, samples: &[i16]) -> Result<()> {
         let Some(handle) = self.wake_recognizer else {
-            return Ok(String::new());
+            return Ok(());
         };
-        unsafe {
-            let complete = (self.accept)(handle.as_ptr(), samples.as_ptr(), samples.len() as c_int);
-            if complete < 0 {
-                bail!("Ошибка детектора активации Vosk");
-            }
-            let ptr = if complete == 0 {
-                (self.partial_result)(handle.as_ptr())
-            } else {
-                (self.result)(handle.as_ptr())
-            };
-            if ptr.is_null() {
-                return Ok(String::new());
-            }
-            let json: serde_json::Value = serde_json::from_slice(CStr::from_ptr(ptr).to_bytes())?;
-            Ok(json[if complete == 0 { "partial" } else { "text" }]
-                .as_str()
-                .unwrap_or_default()
-                .into())
+        let status =
+            unsafe { (self.accept)(handle.as_ptr(), samples.as_ptr(), samples.len() as c_int) };
+        if status < 0 {
+            bail!("Ошибка детектора активации Vosk");
         }
+        Ok(())
+    }
+
+    pub fn finish_wake(&mut self) -> Result<String> {
+        self.wake_recognizer
+            .map_or_else(|| Ok(String::new()), |handle| self.final_text(handle))
     }
 
     pub fn finish(&mut self) -> Result<String> {
-        let ptr = unsafe { (self.final_result)(self.recognizer.as_ptr()) };
+        self.final_text(self.recognizer)
+    }
+
+    fn final_text(&self, handle: NonNull<c_void>) -> Result<String> {
+        let ptr = unsafe { (self.final_result)(handle.as_ptr()) };
         if ptr.is_null() {
             bail!("Vosk вернула пустой финальный результат");
         }
         let json: serde_json::Value =
             serde_json::from_slice(unsafe { CStr::from_ptr(ptr) }.to_bytes())?;
         Ok(json["text"].as_str().unwrap_or_default().into())
-    }
-
-    pub fn partial(&mut self) -> Result<String> {
-        // SAFETY: Vosk owns the NUL-terminated result until the next recognizer call.
-        let ptr = unsafe { (self.partial_result)(self.recognizer.as_ptr()) };
-        if ptr.is_null() {
-            bail!("Vosk вернула пустой частичный результат");
-        }
-        let json: serde_json::Value =
-            serde_json::from_slice(unsafe { CStr::from_ptr(ptr) }.to_bytes())?;
-        Ok(json["partial"].as_str().unwrap_or_default().into())
     }
 }
 
@@ -243,23 +253,21 @@ impl Drop for Vosk {
 pub fn write_wav(path: &Path, samples: &[i16]) -> Result<()> {
     use std::io::Write;
     let mut file = std::fs::File::create(path)?;
-    let size = (samples.len() * 2) as u32;
-    file.write_all(b"RIFF")?;
-    file.write_all(&(36 + size).to_le_bytes())?;
-    file.write_all(b"WAVEfmt ")?;
-    file.write_all(&16u32.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?; // PCM
-    file.write_all(&1u16.to_le_bytes())?; // Mono
-    file.write_all(&16000u32.to_le_bytes())?;
-    file.write_all(&32000u32.to_le_bytes())?;
-    file.write_all(&2u16.to_le_bytes())?;
-    file.write_all(&16u16.to_le_bytes())?;
-    file.write_all(b"data")?;
-    file.write_all(&size.to_le_bytes())?;
+    file.write_all(&pcm_wav_header((samples.len() * 2) as u32, 16000))?;
     for sample in samples {
         file.write_all(&sample.to_le_bytes())?;
     }
     Ok(())
+}
+
+pub(crate) fn pcm_wav_header(size: u32, sample_rate: u32) -> [u8; 44] {
+    let mut header =
+        *b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\0\0\0\0\0\0\0\0\x02\0\x10\0data\0\0\0\0";
+    header[4..8].copy_from_slice(&(36 + size).to_le_bytes());
+    header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&(2 * sample_rate).to_le_bytes());
+    header[40..44].copy_from_slice(&size.to_le_bytes());
+    header
 }
 
 pub fn whisper(

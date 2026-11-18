@@ -8,6 +8,7 @@ pub mod generator;
 pub mod runtime;
 pub mod speech;
 pub mod voice;
+pub mod web_search;
 
 #[cfg(windows)]
 pub mod audio;

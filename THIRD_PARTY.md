@@ -28,3 +28,8 @@ The optional SDL2 runtime in the upstream archive is not bundled.
 Piper is an optional external executable chosen by the user; no Piper binary or
 voice model is distributed in this installer. Each downloaded voice has its own
 model card and license; users can use Windows voices without Piper.
+
+## Markdown rendering
+
+Markdown-it and its dependencies are distributed under the notices reproduced
+in licenses/markdown-frontend-NOTICES.txt. Source: https://github.com/markdown-it/markdown-it

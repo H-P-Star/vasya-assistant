@@ -285,12 +285,9 @@ fn playback_matches(value: &Value, candidate: &MusicCandidate) -> bool {
     if value["playing"] != true {
         return false;
     }
-    if candidate.kind == "artist" {
-        return value["selectedPlaying"] == candidate.id
-            && comparable(value["artist"].as_str().unwrap_or_default())
-                .contains(&comparable(&candidate.title));
-    }
-    if candidate.kind == "playlist" {
+    if candidate.kind != "track" || value["title"].as_str().unwrap_or_default().is_empty() {
+        // Artist/playlist buttons belong to a playback context, whose current track
+        // can have different metadata. The same control also covers missing MediaSession.
         return value["selectedPlaying"] == candidate.id;
     }
     let title = comparable(value["title"].as_str().unwrap_or_default());
@@ -303,11 +300,20 @@ fn playback_matches(value: &Value, candidate: &MusicCandidate) -> bool {
 // Only fixed code is evaluated. Search text and selection IDs travel as CDP data arguments.
 const NATIVE_SNAPSHOT: &str = r#"(() => {
  const rows=[]; const seen=new Set();
- const groups={track:'[class*="CommonTrack_root"], [class*="Track_root"], [class*="HorizontalCardContainer_root"]:has(a[href*="/track/"])',artist:'[class*="ArtistCard_root"], [class*="HorizontalArtistCard_root"]',playlist:'[class*="PlaylistCard_root"], [class*="HorizontalPlaylistCard_root"]'};
- for(const [kind,selector] of Object.entries(groups)) for(const root of document.querySelectorAll(selector)) {
-   const link=[...root.querySelectorAll(kind==='track'?'a[href*="/track/"]':kind==='artist'?'a[href*="/artist/"]':'a[href*="/playlists/"]')].find(a=>a.textContent.trim());
+ const groups={
+   track:['[class*="CommonTrack_root"], [class*="Track_root"], [class*="TrackCard_root"], [class*="HorizontalCardContainer_root"]:has(a[class*="_titleLink"][href*="/track/"])','/track/'],
+   artist:['[class*="ArtistCard_root"], [class*="HorizontalArtistCard_root"]','/artist/'],
+   playlist:['[class*="PlaylistCard_root"], [class*="HorizontalPlaylistCard_root"]','/playlists/']
+ };
+ for(const [kind,[selector,route]] of Object.entries(groups)) for(const root of document.querySelectorAll(selector+', [class*="EntityCard_root"]')) {
+   const canonical = root.querySelector('a[class*="_titleLink"]');
+   // An artist link in a track's subtitle does not make the track card an artist result.
+   const matchesRoute = a => a.getAttribute('href')?.split(/[?#]/,1)[0].includes(route);
+   const link = canonical
+     ? (matchesRoute(canonical) ? canonical : null)
+     : [...root.querySelectorAll('a[href]')].find(a=>matchesRoute(a) && a.textContent.trim());
    const title=link?.textContent?.trim(); if(!title) continue;
-   const artist=[...root.querySelectorAll('a[href*="/artist/"]')].map(a=>a.textContent.trim()).filter(Boolean).join(', ');
+   const artist=kind==='track' ? [...root.querySelectorAll('a[href*="/artist/"]')].map(a=>a.textContent.trim()).filter(Boolean).join(', ') : '';
    const key=kind+'|'+link.href+'|'+title; if(seen.has(key)) continue; seen.add(key);
    if(!root.dataset.vasyaCandidate) root.dataset.vasyaCandidate='vasya-'+Math.random().toString(36).slice(2);
    root.dataset.vasyaKind=kind;
@@ -315,10 +321,19 @@ const NATIVE_SNAPSHOT: &str = r#"(() => {
  }
  const meta=navigator.mediaSession?.metadata;
  let playing=navigator.mediaSession?.playbackState==='playing'||[...document.querySelectorAll('audio,video')].some(m=>!m.paused&&m.currentTime>0);
- const selected=[...document.querySelectorAll('[data-vasya-candidate]')].find(r=>r.querySelector('button[aria-label*="Приостанов"],button[aria-label*="Пауза"],button[aria-label*="Pause"],button[class*="playing"],button[class*="Playing"]'));
+ const selected=[...document.querySelectorAll('[data-vasya-candidate]')].find(r=>r.querySelector('button[aria-label*="Приостанов" i], button[aria-label*="Пауза" i], button[aria-label*="Pause" i], [class*="PlayButtonWithCover_root_playing"]'));
  playing=playing||!!selected;
  return {rows,playback:{playing,title:meta?.title||'',artist:meta?.artist||'',selectedPlaying:selected?.dataset.vasyaCandidate||''}};
 })()"#;
+
+const NATIVE_SELECT_TAB: &str = r#"function(kind) {
+ const names={track:/^(треки|tracks)$/i,artist:/^(исполнители|artists)$/i,playlist:/^(плейлисты|playlists)$/i};
+ const tab=[...document.querySelectorAll('[role="tab"], button[class*="SearchPage_tab"]')]
+   .find(el=>names[kind].test(el.textContent.trim()));
+ if(!tab) return false;
+ if(tab.getAttribute('aria-selected')!=='true'&&!tab.className.includes('SearchPage_tab_selected')) tab.click();
+ return true;
+}"#;
 
 const NATIVE_CLICK: &str = r#"function(id,title,artist) {
  let root=[...document.querySelectorAll('[data-vasya-candidate]')].find(r=>r.dataset.vasyaCandidate===id);
@@ -329,6 +344,7 @@ const NATIVE_CLICK: &str = r#"function(id,title,artist) {
  if(!root) return false;
  const norm=s=>s.toLowerCase().replace(/ё/g,'е').replace(/[^\p{L}\p{N}]/gu,'');
  if(!norm(root.textContent||'').includes(norm(title)) || (artist&&!norm(root.textContent||'').includes(norm(artist)))) return false;
+ if(root.querySelector('[class*="PlayButtonWithCover_root_playing"]')) return true;
  const buttons=[...root.querySelectorAll('button')];
  const button=buttons.find(b=>/приостанов|пауза|pause/i.test(b.getAttribute('aria-label')||''))
    ||buttons.find(b=>/воспроизвед|играть|слушать|play/i.test(b.getAttribute('aria-label')||b.title||'')||/playButton/i.test(b.className)||b.querySelector('use[href*="play"],use[xlink\\:href*="play"],svg[data-icon*="play"]'));
@@ -398,9 +414,24 @@ impl BrowserMusic {
     }
 
     pub fn login(&mut self, settings: &Settings) -> Result<String> {
-        if settings.music_mode == "desktop" && settings.music_service != "youtube" {
-            self.play_native(settings, "", &Category::Track, &|| false)?;
-            return Ok("Музыкальное приложение открыто. Войдите в аккаунт, если требуется.".into());
+        if settings.music_mode == "desktop" {
+            match settings.music_service.as_str() {
+                "yandex" => {
+                    self.chrome = None;
+                    if let Ok(chrome) = self.connect_yandex(settings) {
+                        chrome.call("Page.bringToFront", json!({}))?;
+                        return Ok("Яндекс Музыка подключена".into());
+                    }
+                    open_native(settings, &native_music_uri("yandex", "", &Category::Track))?;
+                    return Ok("Яндекс Музыка открыта. Чтобы включить управление, нажмите «Перезапустить и подключить Яндекс Музыку».".into());
+                }
+                "spotify" => {
+                    self.native_chrome = None;
+                    open_native(settings, &native_music_uri("spotify", "", &Category::Track))?;
+                    return Ok("Spotify открыт. Войдите в аккаунт, если требуется.".into());
+                }
+                _ => {}
+            }
         }
         self.native_chrome = None;
         let url = match settings.music_service.as_str() {
@@ -413,6 +444,17 @@ impl BrowserMusic {
             "Войдите в сервис в открытом окне. Отдельный профиль сохраняется на этом компьютере."
                 .into(),
         )
+    }
+
+    pub fn reconnect_yandex(&mut self, settings: &Settings) -> Result<String> {
+        self.chrome = None;
+        self.native_chrome = None;
+        let _ = std::fs::remove_file(crate::config::data_dir().join("yandex-cdp.json"));
+        let chrome = self.connect_yandex(settings).context(
+            "Яндекс Музыка после перезапуска не предоставила управление воспроизведением",
+        )?;
+        chrome.call("Page.bringToFront", json!({}))?;
+        Ok("Яндекс Музыка подключена".into())
     }
 }
 
@@ -441,6 +483,9 @@ impl MusicService for BrowserMusic {
             ));
         }
         if settings.music_mode == "desktop" {
+            if query.trim().is_empty() {
+                return self.login(settings);
+            }
             return self.play_native(settings, query, category, cancelled);
         }
         self.native_chrome = None;
@@ -572,6 +617,26 @@ fn open_native(settings: &Settings, uri: &str) -> Result<()> {
 }
 
 impl BrowserMusic {
+    fn connect_yandex(&mut self, settings: &Settings) -> Result<&mut Chrome> {
+        if self.native_key != settings.yandex_app_path
+            || self
+                .native_chrome
+                .as_mut()
+                .is_some_and(|c| c.evaluate("1").is_err())
+        {
+            self.native_chrome = None;
+        }
+        if self.native_chrome.is_none() {
+            let executable = native_executable(settings)?
+                .context("Укажите путь к приложению Яндекс Музыки в настройках")?;
+            let chrome = Chrome::connect_saved(self.process.clone())
+                .or_else(|_| Chrome::launch_native(&executable, self.process.clone()))?;
+            self.native_chrome = Some(chrome);
+            self.native_key.clone_from(&settings.yandex_app_path);
+        }
+        Ok(self.native_chrome.as_mut().unwrap())
+    }
+
     fn play_native(
         &mut self,
         settings: &Settings,
@@ -581,54 +646,22 @@ impl BrowserMusic {
     ) -> Result<String> {
         self.chrome = None;
         let request = MusicQuery::parse(query, category);
-        let uri = native_music_uri(&settings.music_service, &request.search, category);
-        let key = format!(
-            "{}|{}|{}",
-            settings.music_service, settings.yandex_app_path, settings.spotify_app_path
-        );
-        let stale = self
-            .native_chrome
-            .as_mut()
-            .is_some_and(|c| c.evaluate("1").is_err());
-        if key != self.native_key || stale {
-            self.native_chrome = None;
-        }
         if settings.music_service == "spotify" {
-            open_native(settings, &uri)?;
-            return Ok(if query.is_empty() {
-                "Spotify открыт".into()
-            } else {
-                format!(
-                    "Поиск Spotify открыт в приложении: {}. Выберите результат и нажмите «Играть».",
-                    request.search
-                )
-            });
+            self.native_chrome = None;
+            open_native(
+                settings,
+                &native_music_uri("spotify", &request.search, category),
+            )?;
+            return Ok(format!(
+                "Поиск Spotify открыт в приложении: {}. Выберите результат и нажмите «Играть».",
+                request.search
+            ));
         }
-        if self.native_chrome.is_none() {
-            let executable = native_executable(settings)?
-                .context("Укажите путь к приложению Яндекс Музыки в настройках")?;
-            self.native_chrome = Chrome::connect_saved(self.process.clone()).ok();
-            if self.native_chrome.is_none() {
-                match Chrome::launch_native(&executable, &uri, self.process.clone()) {
-                    Ok(chrome) => self.native_chrome = Some(chrome),
-                    Err(_) => {
-                        if query.is_empty() {
-                            open_native(settings, &uri)?;
-                            return Ok("Клиент открыт. Для управления нажмите «Подключить Яндекс Музыку» в настройках.".into());
-                        }
-                        bail!("Клиент Яндекс Музыки запущен без подключения к Васе. В настройках нажмите «Перезапустить и подключить» — это один раз перезапустит клиент и включит управление.");
-                    }
-                }
-            }
-            self.native_key = key;
-        }
-        let chrome = self.native_chrome.as_mut().unwrap();
+        let chrome = self.connect_yandex(settings).context(
+            "Для управления Яндекс Музыкой нажмите «Перезапустить и подключить Яндекс Музыку» в настройках",
+        )?;
         if cancelled() {
             bail!("Команда отменена");
-        }
-        if query.is_empty() {
-            chrome.call("Page.bringToFront", json!({}))?;
-            return Ok("Яндекс Музыка подключена".into());
         }
         let mut page = url::Url::parse(
             chrome
@@ -636,7 +669,7 @@ impl BrowserMusic {
                 .as_str()
                 .context("Нет адреса приложения")?,
         )?;
-        if page.scheme() != "music-application" {
+        if page.scheme() != "music-application" || page.host_str() != Some("desktop") {
             bail!("Подключение не относится к официальному клиенту Яндекс Музыки");
         }
         // Navigate inside the native application's origin, refreshing the search state
@@ -646,6 +679,12 @@ impl BrowserMusic {
         page.set_fragment(None);
         page.query_pairs_mut().append_pair("text", &request.search);
         chrome.navigate(page.as_str())?;
+        let kind = match category {
+            Category::Track => "track",
+            Category::Artist => "artist",
+            Category::Playlist => "playlist",
+        };
+        let mut tab_selected = false;
         for _ in 0..28 {
             if cancelled() {
                 bail!("Команда отменена");
@@ -668,30 +707,39 @@ impl BrowserMusic {
                     if cancelled() {
                         bail!("Команда отменена");
                     }
-                    if chrome.call_function(NATIVE_CLICK,json!([{"value":candidate.id},{"value":candidate.title},{"value":candidate.artist}])).ok() == Some(json!(true)) { clicked = true; break; }
+                    if chrome.call_function(
+                        NATIVE_CLICK,
+                        json!([{"value":candidate.id},{"value":candidate.title},{"value":candidate.artist}]),
+                    ).ok() == Some(json!(true)) {
+                        clicked = true;
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(350));
                 }
-                if clicked {
-                    for _ in 0..24 {
-                        if cancelled() {
-                            bail!("Команда отменена");
-                        }
-                        let snapshot = chrome.evaluate(NATIVE_SNAPSHOT).unwrap_or_default();
-                        if playback_matches(&snapshot["playback"], candidate) {
-                            return Ok(format!(
-                                "Играет: {}{}",
-                                candidate.title,
-                                if candidate.artist.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" — {}", candidate.artist)
-                                }
-                            ));
-                        }
-                        std::thread::sleep(Duration::from_millis(400));
-                    }
-                    bail!("Найдено «{}», но клиент не подтвердил воспроизведение. Проверьте вход, подписку и доступность трека в Яндекс Музыке.",candidate.title);
+                if !clicked {
+                    bail!("Найдено «{}». Кнопка воспроизведения недоступна. Проверьте результат в окне Яндекс Музыки.", candidate.title);
                 }
+                for _ in 0..24 {
+                    if cancelled() {
+                        bail!("Команда отменена");
+                    }
+                    let snapshot = chrome.evaluate(NATIVE_SNAPSHOT).unwrap_or_default();
+                    if playback_matches(&snapshot["playback"], candidate) {
+                        let label = if candidate.artist.is_empty() {
+                            candidate.title.clone()
+                        } else {
+                            format!("{} — {}", candidate.title, candidate.artist)
+                        };
+                        return Ok(format!("Играет: {label}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                bail!("Найдено «{}», но клиент не подтвердил воспроизведение. Проверьте вход, подписку и доступность записи в Яндекс Музыке.", candidate.title);
+            } else if !tab_selected {
+                tab_selected = chrome
+                    .call_function(NATIVE_SELECT_TAB, json!([{"value":kind}]))
+                    .ok()
+                    == Some(json!(true));
             }
             std::thread::sleep(Duration::from_millis(400));
         }
@@ -844,11 +892,7 @@ impl Chrome {
             native: true,
         })
     }
-    fn launch_native(
-        executable: &std::path::Path,
-        uri: &str,
-        registry: ProcessRegistry,
-    ) -> Result<Self> {
+    fn launch_native(executable: &std::path::Path, registry: ProcessRegistry) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         drop(listener);
@@ -861,7 +905,6 @@ impl Chrome {
                 Command::new(executable)
                     .arg("--remote-debugging-address=127.0.0.1")
                     .arg(format!("--remote-debugging-port={port}"))
-                    .arg(uri)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()?,

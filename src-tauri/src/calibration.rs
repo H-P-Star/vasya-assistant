@@ -38,7 +38,12 @@ pub fn analyze(samples: &[i16], expected: &str, vosk_text: String, refined_text:
     let heard = normalize(&vosk_text);
     let wake_candidate = (!expected.is_empty()
         && expected.split_whitespace().count() == 1
-        && !heard.is_empty()
+        && heard
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(2)
+            .count()
+            == 2
         && heard.split_whitespace().count() <= 2)
         .then_some(heard);
     let message = if expected.is_empty() { "Шум измерен. Теперь произнесите фразу обычным голосом." }

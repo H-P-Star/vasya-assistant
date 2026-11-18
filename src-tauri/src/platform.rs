@@ -260,8 +260,12 @@ impl crate::runtime::Platform for Windows {
         if settings.tts_volume == 0 || cancelled() {
             return Ok(());
         }
-        if settings.tts_engine == "piper" {
-            let mut bytes = crate::voice::synthesize(settings, text, cancelled)?;
+        let audio = match settings.tts_engine.as_str() {
+            "piper" => Some(crate::voice::synthesize(settings, text, cancelled)?),
+            "fish_audio" => Some(crate::voice::synthesize_fish(settings, text, cancelled)?),
+            _ => None,
+        };
+        if let Some(mut bytes) = audio {
             let duration = crate::voice::scale_wav(&mut bytes, 100)?;
             if cancelled() {
                 return Ok(());
@@ -274,7 +278,7 @@ impl crate::runtime::Platform for Windows {
                 )
                 .as_bool()
                 {
-                    bail!("Windows не смогла воспроизвести голос Piper");
+                    bail!("Windows не смогла воспроизвести звук выбранного голоса");
                 }
             }
             let start = std::time::Instant::now();
