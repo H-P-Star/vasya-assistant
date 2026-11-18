@@ -117,7 +117,7 @@ pub struct MusicQuery {
 impl MusicQuery {
     pub fn parse(query: &str, category: &Category) -> Self {
         let query = query.trim().trim_matches(['«', '»', '"']);
-        if *category == Category::Track {
+        if matches!(category, Category::Track | Category::Auto) {
             for (pattern, min_words) in [
                 (
                     r"(?i)^(.+?)\s+(?:исполнителя|исполнитель|группы|от)\s+(.+)$",
@@ -241,17 +241,23 @@ fn select_candidate<'a>(
     rows: &'a [MusicCandidate],
 ) -> Option<&'a MusicCandidate> {
     let kind = match category {
-        Category::Track => "track",
+        Category::Track | Category::Auto => "track",
         Category::Artist => "artist",
         Category::Playlist => "playlist",
     };
     let title = comparable(&request.title);
     let artist = comparable(&request.artist);
     rows.iter()
-        .filter(|r| r.kind == kind && !r.title.is_empty())
+        .filter(|r| {
+            !r.title.is_empty()
+                && (r.kind == kind || (*category == Category::Auto && r.kind == "artist"))
+        })
         .filter_map(|r| {
             let actual_title = comparable(&r.title);
             let actual_artist = comparable(&r.artist);
+            if r.kind == "artist" && *category == Category::Auto {
+                return (artist.is_empty() && actual_title == title).then_some((38, r));
+            }
             let artist_score = if artist.is_empty() {
                 0
             } else if actual_artist.contains(&artist) {
@@ -265,6 +271,14 @@ fn select_candidate<'a>(
             };
             let title_score = if actual_title == title {
                 40
+            } else if artist.is_empty()
+                && !actual_artist.is_empty()
+                && title
+                    .strip_prefix(&actual_artist)
+                    .or_else(|| title.strip_suffix(&actual_artist))
+                    .is_some_and(|part| !part.is_empty() && actual_title.contains(part))
+            {
+                45
             } else if actual_title.contains(&title) {
                 30
             } else if !artist.is_empty()
@@ -285,6 +299,13 @@ fn playback_matches(value: &Value, candidate: &MusicCandidate) -> bool {
     if value["playing"] != true {
         return false;
     }
+    if candidate.kind == "artist"
+        && value["artist"]
+            .as_str()
+            .is_some_and(|a| comparable(a) == comparable(&candidate.title))
+    {
+        return true;
+    }
     if candidate.kind != "track" || value["title"].as_str().unwrap_or_default().is_empty() {
         // Artist/playlist buttons belong to a playback context, whose current track
         // can have different metadata. The same control also covers missing MediaSession.
@@ -298,35 +319,7 @@ fn playback_matches(value: &Value, candidate: &MusicCandidate) -> bool {
 }
 
 // Only fixed code is evaluated. Search text and selection IDs travel as CDP data arguments.
-const NATIVE_SNAPSHOT: &str = r#"(() => {
- const rows=[]; const seen=new Set();
- const groups={
-   track:['[class*="CommonTrack_root"], [class*="Track_root"], [class*="TrackCard_root"], [class*="HorizontalCardContainer_root"]:has(a[class*="_titleLink"][href*="/track/"])','/track/'],
-   artist:['[class*="ArtistCard_root"], [class*="HorizontalArtistCard_root"]','/artist/'],
-   playlist:['[class*="PlaylistCard_root"], [class*="HorizontalPlaylistCard_root"]','/playlists/']
- };
- for(const [kind,[selector,route]] of Object.entries(groups)) for(const root of document.querySelectorAll(selector+', [class*="EntityCard_root"]')) {
-   const canonical = root.querySelector('a[class*="_titleLink"]');
-   // An artist link in a track's subtitle does not make the track card an artist result.
-   const matchesRoute = a => a.getAttribute('href')?.split(/[?#]/,1)[0].includes(route);
-   const link = canonical
-     ? (matchesRoute(canonical) ? canonical : null)
-     : [...root.querySelectorAll('a[href]')].find(a=>matchesRoute(a) && a.textContent.trim());
-   // CommonTrack can render its title as plain text when track links are disabled.
-   const titleNode=link || (kind==='track' && root.matches('[class*="CommonTrack_root"], [class*="Track_root"]') && root.querySelector('[class*="Meta_title__"], [class*="Meta_albumLink"], [data-test-id="TRACK_TITLE"]'));
-   const title=titleNode?.textContent?.trim(); if(!title) continue;
-   const artist=kind==='track' ? [...root.querySelectorAll('a[href*="/artist/"]')].map(a=>a.textContent.trim()).filter(Boolean).join(', ') : '';
-   const key=kind+'|'+(link?.href||artist)+'|'+title; if(seen.has(key)) continue; seen.add(key);
-   if(!root.dataset.vasyaCandidate) root.dataset.vasyaCandidate='vasya-'+Math.random().toString(36).slice(2);
-   root.dataset.vasyaKind=kind;
-   rows.push({id:root.dataset.vasyaCandidate,title,artist,kind});
- }
- const meta=navigator.mediaSession?.metadata;
- let playing=navigator.mediaSession?.playbackState==='playing'||[...document.querySelectorAll('audio,video')].some(m=>!m.paused&&m.currentTime>0);
- const selected=[...document.querySelectorAll('[data-vasya-candidate]')].find(r=>r.querySelector('button[aria-label*="Приостанов" i], button[aria-label*="Пауза" i], button[aria-label*="Pause" i], [class*="PlayButtonWithCover_root_playing"]'));
- playing=playing||!!selected;
- return {rows,playback:{playing,title:meta?.title||'',artist:meta?.artist||'',selectedPlaying:selected?.dataset.vasyaCandidate||''}};
-})()"#;
+const NATIVE_SNAPSHOT: &str = include_str!("music/results.js");
 
 const NATIVE_SELECT_TAB: &str = r#"function(kind) {
  const names={track:/^(треки|tracks)$/i,artist:/^(исполнители|artists)$/i,playlist:/^(плейлисты|playlists)$/i};
@@ -337,30 +330,7 @@ const NATIVE_SELECT_TAB: &str = r#"function(kind) {
  return true;
 }"#;
 
-const NATIVE_CLICK: &str = r#"function(id,title,artist) {
- let root=[...document.querySelectorAll('[data-vasya-candidate]')].find(r=>r.dataset.vasyaCandidate===id);
- if(!root&&window.__vasyaSelection===id) {
-   root=document.querySelector('main header,[class*="PageHeader_root"],[class*="PageHeader_header"]');
-   if(root) root.dataset.vasyaCandidate=id;
- }
- if(!root) return false;
- const norm=s=>s.toLowerCase().replace(/ё/g,'е').replace(/[^\p{L}\p{N}]/gu,'');
- if(!norm(root.textContent||'').includes(norm(title)) || (artist&&!norm(root.textContent||'').includes(norm(artist)))) return false;
- if(root.querySelector('[class*="PlayButtonWithCover_root_playing"]')) return true;
- const buttons=[...root.querySelectorAll('button')];
- const button=buttons.find(b=>/приостанов|пауза|pause/i.test(b.getAttribute('aria-label')||''))
-   ||buttons.find(b=>/воспроизве[дс]|играть|слушать|play/i.test(b.getAttribute('aria-label')||b.title||'')||/playButton/i.test(b.className)||b.querySelector('use[href*="play"],use[xlink\\:href*="play"],svg[data-icon*="play"]'));
- if(!button) {
-   if(root.dataset.vasyaKind!=='track') {
-     const link=[...root.querySelectorAll('a[href*="/artist/"],a[href*="/playlists/"]')].find(a=>a.textContent.trim());
-     if(link) { window.__vasyaSelection=id; link.click(); }
-   }
-   return false;
- }
- if(button.disabled) return false;
- if(!/приостанов|пауза|pause/i.test(button.getAttribute('aria-label')||'')) button.click();
- return true;
-}"#;
+const NATIVE_CLICK: &str = include_str!("music/activate.js");
 
 // Clicking is a separate step from confirmation. Repeated polls must never toggle pause.
 const START_MUSIC: &str = r#"(() => {
@@ -572,27 +542,22 @@ impl MusicService for BrowserMusic {
             return self.play_native(settings, query, category, cancelled);
         }
         self.native_chrome = None;
-        let mut url = if settings.music_service == "spotify" {
-            let mut url = url::Url::parse("https://open.spotify.com/search/")?;
-            url.path_segments_mut().unwrap().pop_if_empty().push(query);
-            url
-        } else {
-            let mut url = url::Url::parse("https://music.yandex.ru/search")?;
-            let kind = match category {
-                Category::Track => "track",
-                Category::Artist => "artist",
-                Category::Playlist => "playlist",
-            };
-            url.query_pairs_mut()
-                .append_pair("text", query)
-                .append_pair("type", kind);
-            url
-        };
+        if settings.music_service == "yandex" {
+            let request = MusicQuery::parse(query, category);
+            return self.chrome(settings)?.play_yandex(
+                url::Url::parse("https://music.yandex.ru/")?,
+                &request,
+                category,
+                cancelled,
+            );
+        }
+        let mut url = url::Url::parse("https://open.spotify.com/search/")?;
+        url.path_segments_mut().unwrap().pop_if_empty().push(query);
         url.set_fragment(None);
         let chrome = self.chrome(settings)?;
         chrome.navigate(url.as_str())?;
         let category = match category {
-            Category::Track => "track",
+            Category::Track | Category::Auto => "track",
             Category::Artist => "artist",
             Category::Playlist => "playlist",
         };
@@ -626,7 +591,7 @@ pub fn native_music_uri(service: &str, query: &str, category: &Category) -> Stri
     params.append_pair("text", query).append_pair(
         "type",
         match category {
-            Category::Track => "track",
+            Category::Track | Category::Auto => "track",
             Category::Artist => "artist",
             Category::Playlist => "playlist",
         },
@@ -738,7 +703,7 @@ impl BrowserMusic {
         if cancelled() {
             bail!("Команда отменена");
         }
-        let mut page = url::Url::parse(
+        let page = url::Url::parse(
             chrome
                 .evaluate("location.href")?
                 .as_str()
@@ -747,15 +712,35 @@ impl BrowserMusic {
         if page.scheme() != "music-application" || page.host_str() != Some("desktop") {
             bail!("Подключение не относится к официальному клиенту Яндекс Музыки");
         }
+        chrome.play_yandex(page, &request, category, cancelled)
+    }
+}
+
+impl Chrome {
+    fn play_yandex(
+        &mut self,
+        mut page: url::Url,
+        request: &MusicQuery,
+        category: &Category,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
         // Navigate inside the native application's origin, refreshing the search state
         // even when its SPA does not react to a second incoming deep link.
         page.set_path("/search");
         page.set_query(None);
         page.set_fragment(None);
         page.query_pairs_mut().append_pair("text", &request.search);
-        chrome.navigate(page.as_str())?;
+        self.navigate(page.as_str())?;
+        self.play_yandex_results(request, category, cancelled)
+    }
+    fn play_yandex_results(
+        &mut self,
+        request: &MusicQuery,
+        category: &Category,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
         let kind = match category {
-            Category::Track => "track",
+            Category::Track | Category::Auto => "track",
             Category::Artist => "artist",
             Category::Playlist => "playlist",
         };
@@ -764,54 +749,89 @@ impl BrowserMusic {
             if cancelled() {
                 bail!("Команда отменена");
             }
-            let snapshot = match chrome.evaluate(NATIVE_SNAPSHOT) {
+            let snapshot = match self.evaluate(NATIVE_SNAPSHOT) {
                 Ok(value) => value,
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(400));
                     continue;
                 }
             };
+            if let Some(reason) = snapshot["blocked"].as_str() {
+                bail!("Яндекс Музыка: {reason}");
+            }
             let rows: Vec<MusicCandidate> =
                 serde_json::from_value(snapshot["rows"].clone()).unwrap_or_default();
-            if let Some(candidate) = select_candidate(&request, category, &rows) {
-                if playback_matches(&snapshot["playback"], candidate) {
+            if let Some(candidate) = select_candidate(request, category, &rows) {
+                if playback_matches(&snapshot["playback"], candidate)
+                    && (candidate.kind == "track"
+                        || snapshot["playback"]["selectedPlaying"] == candidate.id)
+                {
                     return Ok(format!("Уже играет: {}", candidate.title));
                 }
+                let before = snapshot["playback"].clone();
                 let mut clicked = false;
-                for _ in 0..16 {
-                    if cancelled() {
-                        bail!("Команда отменена");
+                for stage in ["activate", "alternate"] {
+                    let mut opened = false;
+                    for _ in 0..8 {
+                        if cancelled() {
+                            bail!("Команда отменена");
+                        }
+                        let locate = |phase| json!([{"value":candidate.id},{"value":candidate.kind},{"value":candidate.title},{"value":phase}]);
+                        if let Some(point) = self
+                            .call_function(NATIVE_CLICK, locate("hover"))?
+                            .as_object()
+                        {
+                            self.call(
+                                "Input.dispatchMouseEvent",
+                                json!({"type":"mouseMoved","x":point["x"],"y":point["y"]}),
+                            )?;
+                            let target = self.call_function(
+                                NATIVE_CLICK,
+                                locate(if opened { "activate" } else { stage }),
+                            )?;
+                            if let Some(action) = target["action"].as_str() {
+                                if cancelled() {
+                                    bail!("Команда отменена");
+                                }
+                                if action != "open" || !opened {
+                                    let count = if action == "row" { 2 } else { 1 };
+                                    for event in ["mousePressed", "mouseReleased"] {
+                                        self.call("Input.dispatchMouseEvent", json!({"type":event,"x":target["x"],"y":target["y"],"button":"left","clickCount":count}))?;
+                                    }
+                                    if action != "open" {
+                                        clicked = true;
+                                        break;
+                                    }
+                                    opened = true;
+                                }
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
                     }
-                    if chrome.call_function(
-                        NATIVE_CLICK,
-                        json!([{"value":candidate.id},{"value":candidate.title},{"value":candidate.artist}]),
-                    ).ok() == Some(json!(true)) {
-                        clicked = true;
-                        break;
+                    for _ in 0..if stage == "activate" { 10 } else { 20 } {
+                        if cancelled() {
+                            bail!("Команда отменена");
+                        }
+                        let snapshot = self.evaluate(NATIVE_SNAPSHOT)?;
+                        if playback_matches(&snapshot["playback"], candidate)
+                            && (candidate.kind != "artist" || snapshot["playback"] != before)
+                        {
+                            let label = if candidate.artist.is_empty() {
+                                candidate.title.clone()
+                            } else {
+                                format!("{} — {}", candidate.title, candidate.artist)
+                            };
+                            return Ok(format!("Играет: {label}"));
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
                     }
-                    std::thread::sleep(Duration::from_millis(350));
                 }
                 if !clicked {
-                    bail!("Найдено «{}». Кнопка воспроизведения недоступна. Проверьте результат в окне Яндекс Музыки.", candidate.title);
-                }
-                for _ in 0..24 {
-                    if cancelled() {
-                        bail!("Команда отменена");
-                    }
-                    let snapshot = chrome.evaluate(NATIVE_SNAPSHOT).unwrap_or_default();
-                    if playback_matches(&snapshot["playback"], candidate) {
-                        let label = if candidate.artist.is_empty() {
-                            candidate.title.clone()
-                        } else {
-                            format!("{} — {}", candidate.title, candidate.artist)
-                        };
-                        return Ok(format!("Играет: {label}"));
-                    }
-                    std::thread::sleep(Duration::from_millis(400));
+                    bail!("Найдено «{}», но управление воспроизведением недоступно. Проверьте вход и доступность записи в Яндекс Музыке.",candidate.title);
                 }
                 bail!("Найдено «{}», но клиент не подтвердил воспроизведение. Проверьте вход, подписку и доступность записи в Яндекс Музыке.", candidate.title);
-            } else if !tab_selected {
-                tab_selected = chrome
+            } else if !tab_selected && *category != Category::Auto {
+                tab_selected = self
                     .call_function(NATIVE_SELECT_TAB, json!([{"value":kind}]))
                     .ok()
                     == Some(json!(true));
@@ -1057,12 +1077,19 @@ impl Chrome {
     fn launch(browser: &str, registry: ProcessRegistry) -> Result<Self> {
         let executable = browser_executable(browser)?;
         let profile = crate::config::data_dir().join("browser").join(browser);
+        Self::launch_profile(Command::new(executable), profile, registry)
+    }
+
+    fn launch_profile(
+        mut command: Command,
+        profile: PathBuf,
+        registry: ProcessRegistry,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&profile)?;
         let port_file = profile.join("DevToolsActivePort");
         if port_file.exists() {
             std::fs::remove_file(&port_file)?;
         }
-        let mut command = Command::new(executable);
         command
             .arg(format!("--user-data-dir={}", profile.display()))
             .args([
@@ -1198,6 +1225,9 @@ impl Chrome {
             "Runtime.evaluate",
             json!({"expression":expression,"returnByValue":true,"userGesture":true}),
         )?;
+        if !result["exceptionDetails"].is_null() {
+            bail!("Плеер не смог прочитать состояние страницы");
+        }
         Ok(result["result"]["value"].clone())
     }
 }
@@ -1262,6 +1292,49 @@ impl Drop for Chrome {
 mod tests {
     use super::*;
     #[test]
+    #[cfg_attr(
+        not(windows),
+        ignore = "set VASYA_MUSIC_TEST_BROWSER to a Chromium executable"
+    )]
+    fn yandex_selected_result_starts_audio_through_real_pointer_input() -> Result<()> {
+        let executable = std::env::var_os("VASYA_MUSIC_TEST_BROWSER")
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(|| browser_executable("edge"))?;
+        let dir = tempfile::tempdir()?;
+        let mut command = Command::new(executable);
+        command.args(["--headless=new", "--mute-audio"]);
+        #[cfg(target_os = "linux")]
+        command.arg("--no-sandbox"); // Isolated headless fixture in root-owned CI containers.
+        let mut chrome =
+            Chrome::launch_profile(command, dir.path().join("profile"), Default::default())?;
+        let page = dir.path().join("results.html");
+        std::fs::write(&page, include_str!("../tests/fixtures/music-results.html"))?;
+        crate::speech::write_wav(&dir.path().join("sample.wav"), &[0; 16000])?;
+        for mode in ["button", "row", "inert", "artist"] {
+            let mut url = url::Url::from_file_path(&page).unwrap();
+            url.set_fragment(Some(mode));
+            chrome.navigate("about:blank")?;
+            chrome.navigate(url.as_str())?;
+            let (query, category) = if mode == "artist" {
+                ("Кино", Category::Auto)
+            } else {
+                ("Перемен исполнителя Кино", Category::Track)
+            };
+            chrome
+                .play_yandex_results(&MusicQuery::parse(query, &category), &category, &|| false)?;
+            assert_eq!(
+                chrome.evaluate("document.body.dataset.started")?,
+                if mode == "artist" { "artist" } else { "track" }
+            );
+            assert_eq!(
+                chrome.evaluate("!document.querySelector('audio').paused")?,
+                true
+            );
+        }
+        Ok(())
+    }
+    #[test]
     fn track_artist_query_selects_the_right_performer_and_verifies_playback() {
         let request = MusicQuery::parse("«Перемен» исполнителя Кино", &Category::Track);
         assert_eq!(request.title, "Перемен");
@@ -1283,6 +1356,15 @@ mod tests {
         ];
         let selected = select_candidate(&request, &Category::Track, &rows).unwrap();
         assert_eq!(selected.id, "right");
+        for query in ["Кино Перемен", "Перемен Кино"] {
+            let request = MusicQuery::parse(query, &Category::Auto);
+            assert_eq!(
+                select_candidate(&request, &Category::Auto, &rows)
+                    .unwrap()
+                    .id,
+                "right"
+            );
+        }
         assert!(!playback_matches(
             &json!({"playing":true,"title":"Перемен","artist":"Другая группа"}),
             selected

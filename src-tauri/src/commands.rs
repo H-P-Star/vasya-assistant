@@ -285,9 +285,15 @@ pub fn parse_with_settings(
 }
 
 fn music_body(body: &str) -> Command {
-    let mut category = Category::Track;
+    let mut category = if body.trim().is_empty() {
+        Category::Track
+    } else {
+        Category::Auto
+    };
     let mut query = body;
     for (name, kind) in [
+        ("группу", Category::Artist),
+        ("артиста", Category::Artist),
         ("исполнителя", Category::Artist),
         ("плейлист", Category::Playlist),
         ("трек", Category::Track),
@@ -320,6 +326,7 @@ fn volume_payload(payload: &str) -> Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
+    Auto,
     Track,
     Artist,
     Playlist,
@@ -589,24 +596,7 @@ pub fn parse(text: &str, dictating: bool, aliases: &[Alias]) -> Command {
             "поставь",
         ],
     ) {
-        let mut category = Category::Track;
-        let mut query = body;
-        for (name, kind) in [
-            ("исполнителя", Category::Artist),
-            ("плейлист", Category::Playlist),
-            ("трек", Category::Track),
-            ("песню", Category::Track),
-        ] {
-            if let Some(rest) = prefix(body, &[name]) {
-                category = kind;
-                query = rest;
-                break;
-            }
-        }
-        return Command::Music {
-            query: query.into(),
-            category,
-        };
+        return music_body(body);
     }
     Command::Unknown(text.into())
 }

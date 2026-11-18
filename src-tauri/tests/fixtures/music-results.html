@@ -1,0 +1,28 @@
+<!doctype html><html lang="ru"><meta charset="utf-8">
+<style>
+  .EntityCard_root { width: 640px; height: 60px; padding: 8px; }
+  button { visibility: hidden; }
+  .EntityCard_root:hover button { visibility: visible; }
+</style>
+<div class="EntityCard_root" id="decoy"><span class="Meta_title__test">Перемен</span>
+  <a href="/artist/2">Другая группа</a><button>Воспроизвести</button></div>
+<div class="EntityCard_root" id="track"><span class="Meta_title__test">Перемен</span>
+  <a href="/artist/1">Кино</a><button aria-label="Воспроизведение">▶</button></div>
+<div class="EntityCard_root" id="artist"><a class="EntityCard_titleLink" href="/artist/1">Кино</a>
+  <button aria-label="Воспроизведение">▶</button></div>
+<audio src="./sample.wav" loop></audio>
+<script>
+  const mode = location.hash.slice(1);
+  const selected = document.getElementById(mode === 'artist' ? 'artist' : 'track');
+  if (mode === 'row') selected.querySelector('button').remove();
+  selected.addEventListener('click', async event => {
+    if (!event.isTrusted) return;
+    const rowGesture = event.detail === 2 && !event.target.closest('button,a');
+    if (mode === 'row' || mode === 'inert') {
+      if (!rowGesture) return;
+    } else if (!event.target.closest('button')) return;
+    await document.querySelector('audio').play();
+    navigator.mediaSession.metadata = new MediaMetadata({title: 'Перемен', artist: 'Кино'});
+    document.body.dataset.started = selected.id;
+  });
+</script></html>
