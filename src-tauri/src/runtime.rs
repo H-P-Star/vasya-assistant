@@ -468,7 +468,17 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
             }
             let text = crate::calibration::correct(&text, &settings.speech_corrections);
             let original = commands::parse_with_settings(&text, dictating, &settings);
-            let repair_enabled = !preview
+            let immediate = matches!(
+                original,
+                Command::StartMusic(_)
+                    | Command::Pause
+                    | Command::Resume
+                    | Command::Next
+                    | Command::VolumeDown
+                    | Command::VolumeUp
+            ) || matches!(&original, Command::Music { query, .. } if query.is_empty());
+            let repair_enabled = !immediate
+                && !preview
                 && !dictating
                 && settings.llm_repair_speech
                 && !matches!(
@@ -614,6 +624,8 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
         }
         Command::Youtube(query) => browser::youtube(&query),
         Command::Music { query, category } => music.play_with_cancel(&settings, &query, &category,&||state.cancelled(epoch)),
+        Command::StartMusic(service) => music.play_with_cancel(&Settings { music_service: service, ..settings }, "", &commands::Category::Track, &||state.cancelled(epoch)),
+        Command::OpenMusic(service) if service.is_empty() => music.login(&settings),
         Command::OpenMusic(service) => music.login(&Settings { music_service: service, ..settings }),
         Command::Generate(prompt) => {
             let output = crate::generator::generate_with_cancel(&settings, &prompt, || state.cancelled(epoch))?;
@@ -841,7 +853,7 @@ mod tests {
             samples: Some(vec![0; 1600]),
             had_wake: false,
             dictating: false,
-            uncertain: false,
+            uncertain: true,
         };
         execute(&runtime.shared, &mut UnusedMusic, task).unwrap();
         assert_eq!(*platform.media_actions.lock().unwrap(), vec!["pause"]);

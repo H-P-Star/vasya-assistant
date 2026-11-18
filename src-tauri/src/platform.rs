@@ -35,6 +35,38 @@ use windows::{
 
 pub struct Windows;
 
+/// Resume only the requested desktop client, even if another app owns the current session.
+pub(crate) fn resume_client(client: &str) -> Result<bool> {
+    unsafe {
+        RoInitialize(RO_INIT_MULTITHREADED)?;
+    }
+    let result = (|| -> Result<bool> {
+        use windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status;
+        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?.get()?;
+        let sessions = manager.GetSessions()?;
+        for index in 0..sessions.Size()? {
+            let session = sessions.GetAt(index)?;
+            let id = session
+                .SourceAppUserModelId()?
+                .to_string()
+                .to_lowercase()
+                .replace([' ', '.', '-'], "");
+            if !id.contains(client) {
+                continue;
+            }
+            if session.GetPlaybackInfo()?.PlaybackStatus()? == Status::Playing {
+                return Ok(true);
+            }
+            return Ok(session.TryPlayAsync()?.get()?);
+        }
+        Ok(false)
+    })();
+    unsafe {
+        RoUninitialize();
+    }
+    result
+}
+
 pub fn copy_text(text: &str, owner: isize) -> Result<()> {
     use windows::Win32::{
         Foundation::{GlobalFree, HANDLE},

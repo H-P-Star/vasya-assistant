@@ -312,9 +312,11 @@ const NATIVE_SNAPSHOT: &str = r#"(() => {
    const link = canonical
      ? (matchesRoute(canonical) ? canonical : null)
      : [...root.querySelectorAll('a[href]')].find(a=>matchesRoute(a) && a.textContent.trim());
-   const title=link?.textContent?.trim(); if(!title) continue;
+   // CommonTrack can render its title as plain text when track links are disabled.
+   const titleNode=link || (kind==='track' && root.matches('[class*="CommonTrack_root"], [class*="Track_root"]') && root.querySelector('[class*="Meta_title__"], [class*="Meta_albumLink"], [data-test-id="TRACK_TITLE"]'));
+   const title=titleNode?.textContent?.trim(); if(!title) continue;
    const artist=kind==='track' ? [...root.querySelectorAll('a[href*="/artist/"]')].map(a=>a.textContent.trim()).filter(Boolean).join(', ') : '';
-   const key=kind+'|'+link.href+'|'+title; if(seen.has(key)) continue; seen.add(key);
+   const key=kind+'|'+(link?.href||artist)+'|'+title; if(seen.has(key)) continue; seen.add(key);
    if(!root.dataset.vasyaCandidate) root.dataset.vasyaCandidate='vasya-'+Math.random().toString(36).slice(2);
    root.dataset.vasyaKind=kind;
    rows.push({id:root.dataset.vasyaCandidate,title,artist,kind});
@@ -347,7 +349,7 @@ const NATIVE_CLICK: &str = r#"function(id,title,artist) {
  if(root.querySelector('[class*="PlayButtonWithCover_root_playing"]')) return true;
  const buttons=[...root.querySelectorAll('button')];
  const button=buttons.find(b=>/приостанов|пауза|pause/i.test(b.getAttribute('aria-label')||''))
-   ||buttons.find(b=>/воспроизвед|играть|слушать|play/i.test(b.getAttribute('aria-label')||b.title||'')||/playButton/i.test(b.className)||b.querySelector('use[href*="play"],use[xlink\\:href*="play"],svg[data-icon*="play"]'));
+   ||buttons.find(b=>/воспроизве[дс]|играть|слушать|play/i.test(b.getAttribute('aria-label')||b.title||'')||/playButton/i.test(b.className)||b.querySelector('use[href*="play"],use[xlink\\:href*="play"],svg[data-icon*="play"]'));
  if(!button) {
    if(root.dataset.vasyaKind!=='track') {
      const link=[...root.querySelectorAll('a[href*="/artist/"],a[href*="/playlists/"]')].find(a=>a.textContent.trim());
@@ -359,6 +361,47 @@ const NATIVE_CLICK: &str = r#"function(id,title,artist) {
  if(!/приостанов|пауза|pause/i.test(button.getAttribute('aria-label')||'')) button.click();
  return true;
 }"#;
+
+// Clicking is a separate step from confirmation. Repeated polls must never toggle pause.
+const START_MUSIC: &str = r#"(() => {
+ const playing = navigator.mediaSession?.playbackState === 'playing'
+   || [...document.querySelectorAll('audio,video')].some(m => !m.paused && !m.ended && m.readyState >= 2);
+ if (playing) return 'playing';
+ if (window.__vasyaClicked) return 'waiting';
+ const controls = document.querySelector('[class*="PlayerBarDesktop_root"], [data-testid="now-playing-bar"], ytmusic-player-bar');
+ const candidates = [...(controls?.querySelectorAll('button,[role="button"]') || [])];
+ const label = b => [b.getAttribute('aria-label'),b.title].filter(Boolean).join(' ');
+ const available = b => !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+ const resume = candidates.find(b => available(b) && /^(воспроизвести|играть|продолжить|play|resume)(?:\s|$)/i.test(label(b)));
+ const wave = [...document.querySelectorAll('button[class*="VibeBlock_playButton"], [class*="VibeBlock_playButton"] button')].find(available);
+ // On a fresh client the player bar can show a play button with an empty queue.
+ const queued = navigator.mediaSession?.metadata?.title || controls?.querySelector('a[href*="/track/"], [class*="Meta_title__"]');
+ const play = (queued && resume) || wave || resume;
+ if (!play) return 'waiting';
+ window.__vasyaClicked = true;
+ play.click();
+ return 'waiting';
+})()"#;
+
+fn start_music(chrome: &mut Chrome, home: &str, cancelled: &dyn Fn() -> bool) -> Result<String> {
+    chrome.evaluate("window.__vasyaClicked = false")?;
+    for attempt in 0..32 {
+        if cancelled() {
+            bail!("Команда отменена");
+        }
+        if chrome.evaluate(START_MUSIC)?.as_str() == Some("playing") {
+            return Ok("Музыка играет".into());
+        }
+        if attempt == 2
+            && chrome.evaluate("Boolean(window.__vasyaClicked)")? != true
+            && chrome.evaluate("location.href")?.as_str() != Some(home)
+        {
+            chrome.navigate(home)?;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!("Плеер не подтвердил воспроизведение. Проверьте вход в аккаунт и доступность музыки.")
+}
 
 #[derive(Default)]
 pub struct BrowserProcess {
@@ -472,6 +515,49 @@ impl MusicService for BrowserMusic {
         if cancelled() {
             bail!("Команда отменена");
         }
+        if query.trim().is_empty() {
+            if settings.music_mode == "desktop" && settings.music_service == "yandex" {
+                #[cfg(windows)]
+                if crate::platform::resume_client("yandexmusic").unwrap_or(false) {
+                    return Ok("Музыка играет".into());
+                }
+                self.chrome = None;
+                let chrome = self.connect_yandex(settings).context(
+                    "Для управления включите подключение Яндекс Музыки в настройках Васи",
+                )?;
+                return start_music(chrome, "music-application://desktop/", cancelled);
+            }
+            if settings.music_mode == "desktop" && settings.music_service == "spotify" {
+                open_native(settings, "spotify:")?;
+                #[cfg(windows)]
+                {
+                    for _ in 0..18 {
+                        if cancelled() {
+                            bail!("Команда отменена");
+                        }
+                        if crate::platform::resume_client("spotify")? {
+                            return Ok("Spotify включён".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    bail!("Spotify открыт. Выберите первую запись в приложении, чтобы создать очередь воспроизведения.");
+                }
+                #[cfg(not(windows))]
+                bail!("Управление Spotify доступно в Windows");
+            }
+            self.native_chrome = None;
+            let home = match settings.music_service.as_str() {
+                "spotify" => "https://open.spotify.com",
+                "youtube" => "https://music.youtube.com",
+                _ => "https://music.yandex.ru",
+            };
+            let chrome = self.chrome(settings)?;
+            // A browser session may still belong to the previously selected service.
+            if chrome.evaluate("location.origin")?.as_str() != Some(home) {
+                chrome.navigate(home)?;
+            }
+            return start_music(chrome, home, cancelled);
+        }
         if settings.music_service == "youtube" {
             return youtube(&format!(
                 "{query} {}",
@@ -483,9 +569,6 @@ impl MusicService for BrowserMusic {
             ));
         }
         if settings.music_mode == "desktop" {
-            if query.trim().is_empty() {
-                return self.login(settings);
-            }
             return self.play_native(settings, query, category, cancelled);
         }
         self.native_chrome = None;
@@ -507,14 +590,6 @@ impl MusicService for BrowserMusic {
         };
         url.set_fragment(None);
         let chrome = self.chrome(settings)?;
-        if query.is_empty() {
-            chrome.navigate(if settings.music_service == "spotify" {
-                "https://open.spotify.com"
-            } else {
-                "https://music.yandex.ru"
-            })?;
-            return Ok("Музыкальный сервис открыт".into());
-        }
         chrome.navigate(url.as_str())?;
         let category = match category {
             Category::Track => "track",

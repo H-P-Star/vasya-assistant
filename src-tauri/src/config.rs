@@ -354,6 +354,9 @@ fn validate_aliases(aliases: &[Alias]) -> Result<()> {
         }
         if alias.phrase.trim().is_empty()
             || ![
+                "play_yandex",
+                "play_spotify",
+                "open_music",
                 "open_yandex",
                 "open_spotify",
                 "cancel",

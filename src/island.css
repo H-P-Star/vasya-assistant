@@ -5,3 +5,10 @@ html.island-page,.island-page body{margin:0;min-width:0;background:transparent!i
 @media(prefers-reduced-motion:reduce){.island-shell,.island-answer,.thinking .island-symbol,.thinking .island-meter i{animation:none;transition:none}}
 .expanded{display:flex;flex-direction:column;max-height:calc(100vh - 16px)}.expanded .island-pill,.island-answer-heading,.island-answer footer{flex-shrink:0}.expanded .island-answer{min-height:0;overflow:hidden;flex:1}.island-answer article{max-height:calc(100vh - 224px);min-height:0;flex:1}
 .island-answer article.markdown-body{white-space:normal;line-height:1.65}
+
+.island-shell { background: linear-gradient(115deg,#111724,#07090e 67%); box-shadow: inset 0 1px 0 #ffffff29, inset 0 0 0 1px #aabaff25,0 5px 15px #0005; }
+.island-symbol { border-radius: 50%; width: 32px; height: 32px; color: #e1edff; background: radial-gradient(at 30% 20%,#819be8,#344679 60%,#1b233c); }
+.island-caption span { color: #afb8cb; }.island-meter i { background: linear-gradient(#ade5fd,#839ef9); }
+.island-answer-heading>span,.island-answer footer span { color: #a7b1c3; }
+.island-answer footer button:last-child { background: #d8e3ff; color: #172549; }
+.failed .island-symbol { background: #4c262a; color: #ffbeb9; }

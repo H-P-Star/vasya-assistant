@@ -27,31 +27,38 @@ pub fn builtin_catalog() -> Vec<Builtin> {
                 "запусти музыку {query}",
                 "включи музыку",
                 "запусти музыку",
-                "открой музыку",
                 "включи",
             ],
+        ),
+        (
+            "open_music",
+            "Открыть музыкальный сервис",
+            "open_music",
+            vec!["открой музыку"],
         ),
         (
             "yandex",
             "Открыть Яндекс Музыку",
             "open_yandex",
-            vec![
-                "открой яндекс музыку",
-                "включи яндекс музыку",
-                "запусти яндекс музыку",
-            ],
+            vec!["открой яндекс музыку"],
+        ),
+        (
+            "play_yandex",
+            "Включить Яндекс Музыку",
+            "play_yandex",
+            vec!["включи яндекс музыку", "запусти яндекс музыку"],
         ),
         (
             "spotify",
             "Открыть Spotify",
             "open_spotify",
-            vec![
-                "открой spotify",
-                "включи spotify",
-                "запусти spotify",
-                "открой спотифай",
-                "включи спотифай",
-            ],
+            vec!["открой spotify", "открой спотифай"],
+        ),
+        (
+            "play_spotify",
+            "Включить Spotify",
+            "play_spotify",
+            vec!["включи spotify", "запусти spotify", "включи спотифай"],
         ),
         (
             "pause",
@@ -322,6 +329,7 @@ pub enum Category {
 pub enum Command {
     Music { query: String, category: Category },
     OpenMusic(String),
+    StartMusic(String),
     Youtube(String),
     Search(String),
     WebAnswer(String),
@@ -345,21 +353,23 @@ pub enum Command {
 }
 
 pub fn time_sensitive(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Pause
-            | Command::Resume
-            | Command::Next
-            | Command::Volume(_)
-            | Command::VolumeUp
-            | Command::VolumeDown
-            | Command::Mute
-            | Command::Cancel
-            | Command::DictationStart
-            | Command::DictationStop
-            | Command::Disabled
-            | Command::Invalid(_)
-    )
+    matches!(command, Command::Music { query, .. } if query.is_empty())
+        || matches!(
+            command,
+            Command::StartMusic(_)
+                | Command::Pause
+                | Command::Resume
+                | Command::Next
+                | Command::Volume(_)
+                | Command::VolumeUp
+                | Command::VolumeDown
+                | Command::Mute
+                | Command::Cancel
+                | Command::DictationStart
+                | Command::DictationStop
+                | Command::Disabled
+                | Command::Invalid(_)
+        )
 }
 
 pub fn normalize(text: &str) -> String {
@@ -466,16 +476,18 @@ pub fn parse(text: &str, dictating: bool, aliases: &[Alias]) -> Command {
         return command;
     }
     match norm.as_str() {
-        "включи яндекс музыку" | "открой яндекс музыку" | "запусти яндекс музыку" => {
-            return Command::OpenMusic("yandex".into())
+        "открой музыку" => return Command::OpenMusic(String::new()),
+        "открой яндекс музыку" => return Command::OpenMusic("yandex".into()),
+        "включи яндекс музыку" | "запусти яндекс музыку" => {
+            return Command::StartMusic("yandex".into())
         }
-        "включи spotify"
-        | "открой spotify"
-        | "запусти spotify"
-        | "включи спотифай"
-        | "открой спотифай" => return Command::OpenMusic("spotify".into()),
-        "включи музыку" | "запусти музыку" | "открой музыку" | "включи" =>
-        {
+        "открой spotify" | "открой спотифай" => {
+            return Command::OpenMusic("spotify".into())
+        }
+        "включи spotify" | "запусти spotify" | "включи спотифай" => {
+            return Command::StartMusic("spotify".into())
+        }
+        "включи музыку" | "запусти музыку" | "включи" => {
             return Command::Music {
                 query: String::new(),
                 category: Category::Track,
@@ -618,21 +630,40 @@ fn match_alias_rule<'a>(text: &str, aliases: &'a [Alias]) -> Option<(&'a Alias, 
         let template = alias.phrase.contains("{query}");
         let captured = if template {
             let (head, tail) = alias.phrase.split_once("{query}").unwrap();
-            let pattern_for = |s: &str| {
-                normalize(s)
-                    .split_whitespace()
-                    .map(|s| regex::escape(s).replace('е', "[её]"))
-                    .collect::<Vec<_>>()
-                    .join(r"\s+")
-            };
-            let head = pattern_for(head);
-            let tail = pattern_for(tail);
-            let suffix = if tail.is_empty() {
-                "(.+)$".to_string()
-            } else {
-                format!(r"(.+?)\s+{}[.!?]*$", tail)
-            };
-            let pattern = regex::Regex::new(&format!(r"(?i)^{}[\s,:]+{}", head, suffix)).unwrap();
+            // Most templates can be ruled out without constructing a Unicode regex.
+            if let Some(first) = head.split_whitespace().next() {
+                if !norm.starts_with(&normalize(first)) {
+                    continue;
+                }
+            }
+            thread_local! {
+                static CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> = Default::default();
+            }
+            let pattern = CACHE.with_borrow_mut(|cache| {
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+                cache
+                    .entry(alias.phrase.clone())
+                    .or_insert_with(|| {
+                        let pattern_for = |s: &str| {
+                            normalize(s)
+                                .split_whitespace()
+                                .map(|s| regex::escape(s).replace('е', "[её]"))
+                                .collect::<Vec<_>>()
+                                .join(r"\s+")
+                        };
+                        let head = pattern_for(head);
+                        let tail = pattern_for(tail);
+                        let suffix = if tail.is_empty() {
+                            "(.+)$".to_string()
+                        } else {
+                            format!(r"(.+?)\s+{}[.!?]*$", tail)
+                        };
+                        regex::Regex::new(&format!(r"(?i)^{}[\s,:]+{}", head, suffix)).unwrap()
+                    })
+                    .clone()
+            });
             pattern
                 .captures(text)
                 .and_then(|caps| caps.get(1).map(|m| m.as_str()))
@@ -674,6 +705,9 @@ fn alias_command(action: &str, payload: &str) -> Option<Command> {
         "mute" => Command::Mute,
         "volume_up" => Command::VolumeUp,
         "volume_down" => Command::VolumeDown,
+        "play_yandex" => Command::StartMusic("yandex".into()),
+        "play_spotify" => Command::StartMusic("spotify".into()),
+        "open_music" => Command::OpenMusic(String::new()),
         "open_yandex" => Command::OpenMusic("yandex".into()),
         "open_spotify" => Command::OpenMusic("spotify".into()),
         "cancel" => Command::Cancel,
@@ -855,6 +889,25 @@ mod tests {
             parse_with_settings("стоп диктовка", true, &settings),
             Command::DictationStop
         );
+    }
+    #[test]
+    fn opening_a_player_and_starting_music_are_distinct() {
+        let settings = crate::config::Settings::default();
+        for (phrase, command) in [
+            ("открой музыку", Command::OpenMusic(String::new())),
+            (
+                "включи музыку",
+                Command::Music {
+                    query: String::new(),
+                    category: Category::Track,
+                },
+            ),
+            ("включи яндекс музыку", Command::StartMusic("yandex".into())),
+            ("включи спотифай", Command::StartMusic("spotify".into())),
+        ] {
+            assert_eq!(parse_with_settings(phrase, false, &settings), command);
+            assert_eq!(parse(phrase, false, &[]), command);
+        }
     }
     #[test]
     fn custom_rules_override_templates_and_can_be_disabled() {

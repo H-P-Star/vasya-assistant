@@ -12,7 +12,7 @@ type AssistantEvent = {kind: string; text: string; level: number};
 
 const native = isTauri();
 let settings: Settings = {
-  onboarding_complete: false, wake_words: ['вась', 'вася'], activation: 'both', hotkey: 'Ctrl+Alt+Space', microphone: '',
+  onboarding_complete: !native, wake_words: ['вась', 'вася'], activation: 'both', hotkey: 'Ctrl+Alt+Space', microphone: '',
   vosk_library: '', vosk_model: '', speech_mode: 'whisper', whisper_executable: '', whisper_model: '',
   speech_language:'auto',speech_hint:'',speech_gain:1,noise_floor:0.003,wake_aliases:[],speech_corrections:[],
   llm_repair_speech:true, web_search_url:'',
@@ -51,6 +51,7 @@ const paths: Record<string, string> = {
   home: '<path d="M3 12l9-9 9 9M5 10v11h14V10M9 21v-7h6v7"/>',
   settings: '<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="16" cy="17" r="3"/>',
   help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 8a2.5 2.5 0 015 0c0 2-2.5 2-2.5 4M12 16v1"/>',
+  search: '<circle cx="10" cy="10" r="6.5"/><path d="m15 15 5 5"/>',
   arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
   music: '<path d="M9 18V5l12-2v13M9 8l12-2"/><ellipse cx="6" cy="18" rx="3" ry="3"/><ellipse cx="18" cy="16" rx="3" ry="3"/>',
   shield: '<path d="M12 2L3 6v6c0 5 9 10 9 10s9-5 9-10V6zM8 12l3 3 5-6"/>',
@@ -112,6 +113,7 @@ function updateStatus() {
   const indicator = document.getElementById('capture-state');
   if (indicator) indicator.textContent = muted ? 'Микрофон отключён' : captureOpen ? 'Микрофон используется' : 'Микрофон свободен';
   $('app').classList.toggle('muted', muted);
+  $('app').classList.toggle('capturing', captureOpen && !muted);
 }
 
 function navigate(next: typeof page) {
@@ -126,7 +128,6 @@ function shell() {
   $('app').innerHTML = `
     <aside class="sidebar">
       <a class="brand" href="#home" aria-label="Вася, главная"><span class="brand-mark">${icon('mic', 23)}</span><span>вася<span class="brand-dot">.</span></span></a>
-      <div class="sidebar-caption">ВАШ ГОЛОС. ВАШ КОМПЬЮТЕР.</div>
       <nav aria-label="Основная навигация">
         <button data-page="home">${icon('home')}<span>Помощник</span></button>
         <button data-page="settings">${icon('settings')}<span>Настройки</span></button>
@@ -146,9 +147,14 @@ function shell() {
 }
 
 function render() {
-  document.querySelectorAll('[data-page]').forEach(button => button.classList.toggle('active', (button as HTMLElement).dataset.page === page));
+  document.querySelectorAll<HTMLElement>('[data-page]').forEach(button => {
+    const selected = button.dataset.page === page;
+    button.classList.toggle('active', selected);
+    if (selected) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  });
   const errorMarkup = '<div id="error" class="error-box" role="alert" hidden><span></span><button id="dismiss-error" aria-label="Скрыть ошибку">×</button></div>';
-  const top = (title: string, description: string) => `<header class="page-header"><div><span class="eyebrow">ЛИЧНЫЙ ГОЛОСОВОЙ ПОМОЩНИК</span><h1>${title}</h1><p>${description}</p></div><span class="local-badge"><i></i> Локально</span></header>${errorMarkup}`;
+  const top = (title: string, description: string) => `<header class="page-header"><div><h1>${title}</h1><p>${description}</p></div></header>${errorMarkup}`;
   if(!connected){$('content').innerHTML=top('Подключаюсь к Васе…','Загружаю сохранённые настройки.');showError();$('dismiss-error').onclick=()=>{error='';showError();};return;}
   if (page === 'home' && !settings.onboarding_complete) {
     $('content').innerHTML = top('Давайте познакомимся.', 'Два шага — и можно говорить с Васей.') + `
@@ -182,10 +188,10 @@ function render() {
     return;
   }
   if (page === 'home') {
-    $('content').innerHTML = top('Привет. Я Вася.', 'Помогу с музыкой, поиском и текстом. Просто позовите.') + `
+    $('content').innerHTML = top('Голосовой помощник', 'Музыка, ответы и управление компьютером.') + `
       <section class="listen-card" aria-label="Состояние помощника">
-        <div class="listen-top"><span class="section-label">НА СВЯЗИ</span><span id="capture-state" class="capture-label"></span></div>
-        <div class="voice-orb">${icon('mic', 39)}</div>
+        <div class="listen-top"><span id="capture-state" class="capture-label"></span></div>
+        <div class="signal-art" aria-hidden="true"><div class="orbit orbit-far"></div><div class="signal-core"><div class="core-lines"></div></div><div class="orbit orbit-near"></div></div>
         <h2 id="status" aria-live="polite"></h2>
         <p class="wake-hint">${settings.activation === 'hotkey' ? `Нажмите <kbd>${esc(settings.hotkey)}</kbd> и произнесите команду` : `Скажите <strong>«${esc(settings.wake_words.join('» или «'))}»</strong>${settings.activation === 'both' ? ` или нажмите <kbd>${esc(settings.hotkey)}</kbd>` : ''}`}</p>
         <div class="sound-meter" aria-hidden="true">${Array.from({length: 31}, (_, i) => `<i style="--height:${8 + (Math.sin(i * 1.9) + 1) * 12}px"></i>`).join('')}</div>
@@ -195,7 +201,7 @@ function render() {
       <div class="context-strip"><span>${icon('music', 17)} <strong>${serviceNames[settings.music_service]}</strong></span><span>${icon('shield', 17)} ${settings.speech_mode === 'vosk' ? 'Vosk' : 'Vosk + Whisper'} · на устройстве</span><button id="quick-settings">Настроить ${icon('arrow', 16)}</button></div>
       <section class="examples"><div class="section-heading"><h2>С чего начнём?</h2><span>Нажмите, чтобы попробовать</span></div><div class="example-grid">
         <button data-command="включи исполнителя Кино"><span class="example-icon peach">${icon('music')}</span><strong>Музыку под настроение</strong><span>«Вась, включи исполнителя Кино»</span></button>
-        <button data-command="узнай в интернете что такое IPv6"><span class="example-icon lilac">${icon('arrow')}</span><strong>Найти ответ в интернете</strong><span>«Вась, узнай в интернете, что такое IPv6»</span></button>
+        <button data-command="узнай в интернете что такое IPv6"><span class="example-icon lilac">${icon('search')}</span><strong>Найти ответ в интернете</strong><span>«Вась, узнай в интернете, что такое IPv6»</span></button>
         <button data-command="напиши, что такое IPv6"><span class="example-icon mint">${icon('key')}</span><strong>Помочь с текстом</strong><span>«Вась, напиши, что такое IPv6»</span></button>
       </div></section>
       <section class="command-box"><div class="section-heading"><label for="command">Сообщение или команда</label><button id="new-dialogue" type="button" class="text-button">Новый разговор</button></div><form id="command-form"><input id="command" placeholder="Например: расскажи анекдот про программистов" maxlength="8000" autocomplete="off"/><button class="icon-button" type="submit" aria-label="Выполнить команду">${icon('arrow')}</button></form></section>
@@ -304,7 +310,7 @@ function render() {
 }
 
 const commandActions: Record<string, string> = {
-  open_yandex:'Открыть Яндекс Музыку',open_spotify:'Открыть Spotify',cancel:'Отмена',
+  play_spotify:'Включить Spotify',play_yandex:'Включить Яндекс Музыку',open_music:'Открыть основной сервис',open_yandex:'Открыть Яндекс Музыку',open_spotify:'Открыть Spotify',cancel:'Отмена',
   music: 'Включить трек', music_artist: 'Включить исполнителя', music_playlist: 'Включить плейлист',
   search: 'Поиск в браузере', web_answer: 'Ответ из интернета', youtube: 'Видео YouTube', generate: 'Сгенерировать текст',
   insert: 'Вставить текст', answer: 'Ответить фразой', launch_app: 'Открыть программу (.exe)',
