@@ -19,6 +19,7 @@ let settings: Settings = {
   tts_engine:'windows',tts_voice:'',tts_volume:80,tts_rate:0,piper_executable:'',piper_model:'',piper_speaker:0,voice_presets:[],
   fish_voice:'', fish_model:'s2.1-pro-free',
   music_service: 'yandex', browser: 'edge', music_mode: 'desktop', yandex_app_path: '', spotify_app_path: '',
+  island_bg:"#192234", island_edge:"#b8caff", island_mic:"#617aba", island_flat:false, cue_volume:20,cue_path:"",duck_percent:25,recognition_speed:"balanced",replies:{},
   island_enabled: true, llm_fallback: true, voice_feedback: true, start_muted: false,
   start_in_tray: false, command_timeout: 10, llm_provider: 'lm_studio', llm_url: 'http://198.18.0.1:1234',
   llm_model: 'google/gemma-3-4b',llm_structured:true, llm_style:'casual', aliases: [],builtin_overrides:[],
@@ -392,6 +393,7 @@ function bindCommandEditor() {
   };
 }
 
+const replyNames = {Music:'Музыка',StartMusic:'Запуск сервиса с музыкой',OpenMusic:'Открытие сервиса',Pause:'Пауза',Resume:'Продолжение',Next:'Следующий трек',Volume:'Установка громкости',VolumeUp:'Громче',VolumeDown:'Тише',Answer:'Разговор',Search:'Поиск',WebAnswer:'Ответ из интернета',Generate:'Генерация',Youtube:'YouTube',Insert:'Вставка',DictationStart:'Начало диктовки',DictationStop:'Конец диктовки',Mute:'Отключение микрофона',Cancel:'Отмена',LaunchApp:'Запуск приложения'};
 function field(name: string, label: string, hint = '', type = 'text') {
   return `<label class="field">${label}<input id="${name}" name="${name}" type="${type}" ${type === 'number' ? 'min="3" max="60"' : ''}/>${hint ? `<small>${hint}</small>` : ''}</label>`;
 }
@@ -484,6 +486,11 @@ function settingsForm() {
     <div class="form-grid"><label class="field">Способ активации<select id="activation"><option value="both">Слово и горячая клавиша</option><option value="wake">Только слово</option><option value="hotkey">Только горячая клавиша</option></select></label>${field('hotkey', 'Горячая клавиша', 'Например: Ctrl+Alt+Space')}</div>
     <div class="form-grid">${field('wake_words', 'Слова активации', 'Несколько вариантов через запятую')}${field('command_timeout', 'Ожидание команды, секунд', 'После слова или нажатия клавиши', 'number')}</div>
     ${field('wake_aliases', 'Варианты вызова из калибровки', 'Через запятую. Удалите обычные слова, если Вася реагирует на них в разговоре.')}
+    <label class="field">Скорость распознавания<select id="recognition_speed"><option value="fast">Быстро · распознанные команды сразу через Vosk</option><option value="balanced">Сбалансированно</option><option value="precise">Точнее · уточнять через Whisper в гибридном режиме</option></select></label>
+    <div class="card-title"><h2>Остров и звук вызова</h2></div><div class="form-grid">${field('island_bg','Фон острова','','color')}${field('island_edge','Обводка','','color')}${field('island_mic','Фон микрофона','','color')}<label><input id="island_flat" type="checkbox"> Плоский дизайн</label></div>
+    ${field('cue_path','Свой звук вызова','Короткий WAV PCM 16 бит. Пустое поле — встроенный сигнал.')}
+    <div class="form-grid"><label class="field">Громкость сигнала, %<input id="cue_volume" type="number" min="0" max="100"></label><label class="field">Приглушение других приложений, %<input id="duck_percent" type="number" min="0" max="100"></label></div>
+    <details><summary>Фразы голосового подтверждения</summary><p>Пустое поле — обычный ответ. Один дефис — без озвучивания.</p>${Object.entries(replyNames).map(([key,label])=>`<label class="field">${label}<input data-reply="${key}" maxlength="300" value="${esc(settings.replies[key]||'')}"></label>`).join('')}</details>
     <div class="check-grid"><label><input type="checkbox" id="voice_feedback"/> Голосовое подтверждение</label><label><input type="checkbox" id="island_enabled"/> Показывать панель активации поверх окон</label><label><input type="checkbox" id="start_muted"/> Запускать с выключенным микрофоном</label><label><input type="checkbox" id="start_in_tray"/> Открывать сразу в трее</label></div></section>
     <section class="settings-card"><div class="card-title">${icon('shield')}<h2>Распознавание речи</h2><span class="tag">Локально</span></div>
     <label class="field">Режим<select id="speech_mode"><option value="vosk">Vosk — быстрые команды и диктовка</option><option value="whisper">Vosk + Whisper — уточнение активированных фраз</option></select></label>
@@ -538,6 +545,7 @@ function readForm(): Settings {
       ? element.value.split(',').map(w => w.trim().toLowerCase()).filter(Boolean) : element.value.trim();
   }
   for(const key of ['vosk_library','vosk_model','whisper_executable','whisper_model','yandex_app_path','spotify_app_path','piper_executable','piper_model'] as const) next[key]=next[key].replace(/^"(.*)"$/,'$1');
+  document.querySelectorAll<HTMLInputElement>('[data-reply]').forEach(el=>{next.replies[el.dataset.reply!]=el.value.trim();});
   return next;
 }
 async function saveForm(event: Event) {

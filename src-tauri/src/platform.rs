@@ -426,3 +426,114 @@ impl crate::runtime::Platform for Windows {
         Ok(())
     }
 }
+
+pub fn activation_sound(state: std::sync::Arc<crate::runtime::Shared>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut worker = state.cue_worker.lock().unwrap();
+    if state.stop.load(SeqCst) || worker.as_ref().is_some_and(|w| !w.is_finished()) {
+        return;
+    }
+    let shared = state.clone();
+    let epoch = shared.epoch.load(SeqCst);
+    *worker = Some(std::thread::spawn(move || {
+        let settings = shared.snapshot();
+        if settings.cue_volume > 0 {
+            let result = (|| -> Result<()> {
+                use windows::Win32::Media::Audio::{
+                    PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC,
+                };
+                let mut wav = if settings.cue_path.trim().is_empty() {
+                    let n = 1600;
+                    let mut bytes = crate::speech::pcm_wav_header(n * 2, 16000).to_vec();
+                    for i in 0..n {
+                        let t = i as f32 / n as f32;
+                        let sample = (9000.0
+                            * (std::f32::consts::PI * t).sin().powi(2)
+                            * (std::f32::consts::TAU * (62.0 * t + 12.0 * t * t)).sin())
+                            as i16;
+                        bytes.extend(sample.to_le_bytes());
+                    }
+                    bytes
+                } else {
+                    if std::fs::metadata(&settings.cue_path)?.len() > 2_000_000 {
+                        bail!("Слишком большой файл сигнала");
+                    }
+                    std::fs::read(&settings.cue_path)?
+                };
+                if crate::voice::scale_wav(&mut wav, settings.cue_volume)?.as_secs_f32() > 2.0 {
+                    bail!("Выберите сигнал длительностью до двух секунд");
+                }
+                if unsafe {
+                    !PlaySoundW(
+                        PCWSTR(wav.as_ptr().cast()),
+                        None,
+                        SND_SYNC | SND_MEMORY | SND_NODEFAULT,
+                    )
+                    .as_bool()
+                } {
+                    bail!("Windows не воспроизвела сигнал");
+                }
+                Ok(())
+            })();
+            if let Err(err) = result {
+                shared.emit("error", format!("Звук вызова: {err}"));
+            }
+        }
+        let listening =
+            || !shared.cancelled(epoch) && !shared.busy.load(SeqCst) && !shared.stop.load(SeqCst);
+        if settings.duck_percent == 0 || !listening() {
+            return;
+        }
+        let _ = duck_apps(settings.duck_percent, settings.command_timeout, listening);
+    }));
+}
+
+fn duck_apps(percent: u16, timeout: u64, listening: impl Fn() -> bool) -> Result<()> {
+    use windows::{
+        core::Interface,
+        Win32::Media::Audio::{IAudioSessionControl2, IAudioSessionManager2, ISimpleAudioVolume},
+    };
+    let _com = Com::init()?;
+    unsafe {
+        let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let manager: IAudioSessionManager2 = devices
+            .GetDefaultAudioEndpoint(eRender, eConsole)?
+            .Activate(CLSCTX_ALL, None)?;
+        let sessions = manager.GetSessionEnumerator()?;
+        let mut changed = Vec::new();
+        for i in 0..sessions.GetCount()? {
+            let Ok(session) = sessions.GetSession(i) else {
+                continue;
+            };
+            let Ok(info) = session.cast::<IAudioSessionControl2>() else {
+                continue;
+            };
+            if info.GetProcessId().ok() == Some(std::process::id()) {
+                continue;
+            }
+            let Ok(volume) = session.cast::<ISimpleAudioVolume>() else {
+                continue;
+            };
+            let Ok(original) = volume.GetMasterVolume() else {
+                continue;
+            };
+            let reduced = original * (1.0 - percent as f32 / 100.0);
+            if volume.SetMasterVolume(reduced, std::ptr::null()).is_ok() {
+                changed.push((volume, original, reduced));
+            }
+        }
+        let start = std::time::Instant::now();
+        while listening() && start.elapsed().as_secs() < timeout {
+            std::thread::sleep(std::time::Duration::from_millis(35));
+        }
+        for (volume, original, reduced) in changed {
+            if volume
+                .GetMasterVolume()
+                .is_ok_and(|v| (v - reduced).abs() < 0.0001)
+            {
+                let _ = volume.SetMasterVolume(original, std::ptr::null());
+            }
+        }
+    }
+    Ok(())
+}

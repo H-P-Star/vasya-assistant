@@ -8,6 +8,7 @@ export type Settings={
  speech_language:string;speech_hint:string;speech_gain:number;noise_floor:number;wake_aliases:string[];speech_corrections:{heard:string;replacement:string}[];
  llm_repair_speech:boolean;web_search_url:string;
  music_service:string;browser:string;music_mode:'desktop'|'browser';yandex_app_path:string;spotify_app_path:string;
+ island_bg:string;island_edge:string;island_mic:string;island_flat:boolean;cue_volume:number;cue_path:string;duck_percent:number;recognition_speed:string;replies:Record<string,string>;
  island_enabled:boolean;llm_fallback:boolean;voice_feedback:boolean;start_muted:boolean;start_in_tray:boolean;command_timeout:number;
  tts_engine:string;tts_voice:string;tts_volume:number;tts_rate:number;piper_executable:string;piper_model:string;piper_speaker:number;voice_presets:VoicePreset[];
  fish_voice:string;fish_model:string;

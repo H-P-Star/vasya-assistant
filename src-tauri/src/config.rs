@@ -132,6 +132,15 @@ pub struct Settings {
     pub music_mode: String,
     pub yandex_app_path: String,
     pub spotify_app_path: String,
+    pub island_bg: String,
+    pub island_edge: String,
+    pub island_mic: String,
+    pub island_flat: bool,
+    pub cue_volume: u16,
+    pub cue_path: String,
+    pub duck_percent: u16,
+    pub recognition_speed: String,
+    pub replies: std::collections::BTreeMap<String, String>,
     pub island_enabled: bool,
     pub llm_fallback: bool,
     pub voice_feedback: bool,
@@ -190,6 +199,15 @@ impl Default for Settings {
             music_mode: "desktop".into(),
             yandex_app_path: String::new(),
             spotify_app_path: String::new(),
+            island_bg: "#192234".into(),
+            island_edge: "#b8caff".into(),
+            island_mic: "#617aba".into(),
+            island_flat: false,
+            cue_volume: 20,
+            cue_path: String::new(),
+            duck_percent: 25,
+            recognition_speed: "balanced".into(),
+            replies: Default::default(),
             island_enabled: true,
             llm_fallback: true,
             voice_feedback: true,
@@ -230,6 +248,23 @@ impl Settings {
         }
         if !["edge", "chrome"].contains(&self.browser.as_str()) {
             bail!("Неизвестный браузер");
+        }
+        if self.cue_volume > 100
+            || self.duck_percent > 100
+            || !matches!(
+                self.recognition_speed.as_str(),
+                "fast" | "balanced" | "precise"
+            )
+        {
+            bail!("Проверьте громкость сигнала и режим скорости");
+        }
+        for color in [&self.island_bg, &self.island_edge, &self.island_mic] {
+            if color.len() != 7
+                || !color.starts_with('#')
+                || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("Некорректный цвет острова");
+            }
         }
         if !(3..=60).contains(&self.command_timeout) {
             bail!("Ожидание команды: от 3 до 60 секунд");

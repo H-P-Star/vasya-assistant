@@ -467,6 +467,11 @@ pub fn run() {
                     }
                 }
                 crate::island::update(&handle, &event);
+                if event.kind == "activated" {
+                    if let Some(runtime) = handle.try_state::<Runtime>() {
+                        crate::platform::activation_sound(runtime.shared.clone());
+                    }
+                }
                 let _ = handle.emit("assistant", event);
             });
             let runtime = Runtime::start_with_resources(

@@ -730,7 +730,46 @@ impl Chrome {
         page.set_query(None);
         page.set_fragment(None);
         page.query_pairs_mut().append_pair("text", &request.search);
-        self.navigate(page.as_str())?;
+        // Update the search box in the existing renderer so the player and queue stay alive.
+        let expected = page.as_str();
+        let same_service = self
+            .evaluate("location.href")?
+            .as_str()
+            .and_then(|s| url::Url::parse(s).ok())
+            .is_some_and(|active| {
+                active.scheme() == page.scheme() && active.host_str() == page.host_str()
+            });
+        let current_query = |this: &mut Chrome| -> bool {
+            this.evaluate("location.pathname === '/search' ? new URLSearchParams(location.search).get('text') : null")
+                .ok().and_then(|v|v.as_str().map(str::to_owned)).as_deref()==Some(request.search.as_str())
+        };
+        let mut ready = same_service && current_query(self);
+        if same_service && !ready {
+            let updated=self.call_function(r#"function(query) {
+              const box=document.querySelector('input[type="search"],input[class*="SearchInput"],input[placeholder*="Поиск"]');
+              if(location.pathname!='/search'||!box)return false;
+              Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(box,query);
+              box.dispatchEvent(new Event('input',{bubbles:true}));return true;
+            }"#,json!([{"value":request.search}])).unwrap_or_default()==true;
+            if updated {
+                for _ in 0..10 {
+                    if cancelled() {
+                        bail!("Команда отменена");
+                    }
+                    if current_query(self) {
+                        ready = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(60));
+                }
+            }
+        }
+        if !ready {
+            let result = self.call("Page.navigate", json!({"url":expected}))?;
+            if let Some(error) = result["errorText"].as_str() {
+                bail!("Яндекс Музыка: {error}");
+            }
+        }
         self.play_yandex_results(request, category, cancelled)
     }
     fn play_yandex_results(
@@ -745,14 +784,15 @@ impl Chrome {
             Category::Playlist => "playlist",
         };
         let mut tab_selected = false;
-        for _ in 0..28 {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline {
             if cancelled() {
                 bail!("Команда отменена");
             }
             let snapshot = match self.evaluate(NATIVE_SNAPSHOT) {
                 Ok(value) => value,
                 Err(_) => {
-                    std::thread::sleep(Duration::from_millis(400));
+                    std::thread::sleep(Duration::from_millis(180));
                     continue;
                 }
             };
@@ -836,7 +876,7 @@ impl Chrome {
                     .ok()
                     == Some(json!(true));
             }
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(180));
         }
         bail!("В приложении не найден подходящий результат для «{}». Уточните название и исполнителя либо проверьте вход в Яндекс Музыку.",request.search);
     }

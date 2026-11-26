@@ -47,3 +47,13 @@ html.island-page,.island-page body{margin:0;min-width:0;background:transparent!i
   .island-shell { background: #151b27; backdrop-filter: none; }
   .island-shell::before { background: #95a5c4; }
 }
+.island-shell { background:linear-gradient(145deg,#ffffff19,transparent 55%),color-mix(in srgb,var(--glass-base,#192234) 88%,transparent); animation-duration:.12s; }
+.island-shell::before {background:linear-gradient(145deg,#ffffffa0,var(--glass-edge,#b8caff) 28%,transparent 65%,var(--glass-edge,#b8caff));}
+.island-symbol {background:linear-gradient(150deg,#ffffff55,transparent 60%),var(--mic-base,#617aba);}
+.island-shell.flat {background:var(--glass-base);box-shadow:inset 0 0 0 1px var(--glass-edge);backdrop-filter:none;}
+.flat::before {background:none;}
+.flat .island-symbol {background:var(--mic-base);box-shadow:none;}
+.island-close {position:relative;align-self:center;font-size:0;display:grid;place-items:center;}
+.island-close::before,.island-close::after {content:"";position:absolute;width:10px;height:1.5px;background:currentColor;border-radius:2px;transform:rotate(45deg);}
+.island-close::after {transform:rotate(-45deg);}
+@media(prefers-reduced-transparency:reduce){.island-shell{background:var(--glass-base,#192234);}}

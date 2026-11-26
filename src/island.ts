@@ -28,9 +28,12 @@ export async function startIsland(){
  document.getElementById('island-main')!.onclick=()=>{if(isTauri())void invoke('show_main');};
  document.getElementById('island-copy')!.onclick=async()=>{try{if(isTauri())await invoke('copy_result');else await navigator.clipboard.writeText(result);document.getElementById('island-copy-status')!.textContent='Скопировано';}catch{document.getElementById('island-copy-status')!.textContent='Не удалось скопировать. Откройте ответ в Васе.';}};
  if(!isTauri()){detail.textContent='Предпросмотр · нажмите для примера';result='### Что такое IPv6\n\n**IPv6** — версия интернет-протокола с большим пространством адресов.\n\nПример адреса: `2001:db8::1`. Голосовой ответ можно скопировать прямо из панели.';renderMarkdown(output,result);return;}
+ await listen<[string,string,string,boolean]>('island-style',({payload:[bg,edge,mic,flat]})=>{
+   shell.style.setProperty('--glass-base',bg);shell.style.setProperty('--glass-edge',edge);shell.style.setProperty('--mic-base',mic);shell.classList.toggle('flat',flat);
+ });
  await listen<boolean>('island-layout',({payload})=>layout(payload));
  await listen<AssistantEvent>('assistant',({payload:e})=>{
-  if(e.kind==='activated'){active=true;result='';layout(false);shell.className='island-shell listening';title.textContent='Слушаю';detail.textContent='Произнесите команду';output.textContent='';expandButton.disabled=true;return;}
+  if(e.kind==='activated'||e.kind==='wake_preview'){active=true;result='';layout(false);shell.classList.remove('thinking','failed');shell.classList.add('listening');title.textContent='Слушаю';detail.textContent='Произнесите команду';output.textContent='';expandButton.disabled=true;return;}
   if(e.kind==='deactivated'||(e.kind==='microphone'&&e.text==='muted')){active=false;layout(false);return;}
   if(!active)return;
   if(e.kind==='level'){document.querySelectorAll<HTMLElement>('.island-meter i').forEach((bar,i)=>{bar.style.height=`${4+Math.min(1,e.level)*(14+Math.abs(Math.sin(i*1.9))*13)}px`;});return;}

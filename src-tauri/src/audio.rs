@@ -433,11 +433,16 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
     let mut input = None;
     let mut utterance = Vec::new();
     let mut epoch = state.epoch.load(SeqCst);
+    let mut quiet_samples = 0usize;
+    let mut previewed = false;
+    let mut checked = Instant::now();
     let mut status = String::new();
     while !state.stop.load(SeqCst) && state.config_version.load(SeqCst) == version {
         let now = Instant::now();
         if epoch != state.epoch.load(SeqCst) {
             epoch = state.epoch.load(SeqCst);
+            previewed = false;
+            quiet_samples = 0;
             gate.reset();
             vosk.reset();
             utterance.clear();
@@ -448,6 +453,8 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
             // Do not reinterpret audio buffered before the key press as a new command.
             input = None;
             state.capture_open.store(false, SeqCst);
+            previewed = false;
+            quiet_samples = 0;
             gate.arm(now);
             vosk.reset();
             utterance.clear();
@@ -524,7 +531,36 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
         if voice_wake && !gate.armed(now) {
             vosk.feed_wake(&samples)?;
         }
-        if let Some((text, confidence)) = vosk.accept_transcript(&samples)? {
+        let mut transcript = vosk.accept_transcript(&samples)?;
+        if settings.recognition_speed == "fast" && !dictating {
+            let previous = quiet_samples;
+            quiet_samples = if rms < settings.noise_floor.max(0.001) {
+                quiet_samples.saturating_add(samples.len())
+            } else {
+                0
+            };
+            // Commit a nonempty hypothesis after 350 ms of trailing silence.
+            if transcript.is_none()
+                && previous < 5600
+                && quiet_samples >= 5600
+                && !vosk.partial().is_empty()
+            {
+                transcript = Some((vosk.finish()?, Vec::new()));
+            }
+        }
+        if transcript.is_none()
+            && voice_wake
+            && !gate.armed(now)
+            && !previewed
+            && checked.elapsed() >= Duration::from_millis(100)
+        {
+            checked = now;
+            if strip_wake(&vosk.partial(), &wake_words).is_some() {
+                state.emit("wake_preview", "Слушаю");
+                previewed = true;
+            }
+        }
+        if let Some((text, confidence)) = transcript {
             let text = if voice_wake && !gate.armed(now) && strip_wake(&text, &wake_words).is_none()
             {
                 confirm_restricted_wake(&text, &vosk.finish_wake()?, &wake_words, &settings)
@@ -574,9 +610,15 @@ fn session(state: &Arc<Shared>, sender: &SyncSender<Task>, version: u64) -> Resu
                         }
                     }
                 }
-                Accepted::Ignore => {}
+                Accepted::Ignore => {
+                    if previewed {
+                        state.emit("deactivated", "");
+                    }
+                }
             }
             utterance.clear();
+            quiet_samples = 0;
+            previewed = false;
             vosk.reset_wake();
         }
     }

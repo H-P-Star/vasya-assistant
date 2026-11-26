@@ -50,6 +50,9 @@ pub struct Shared {
     pub stop: AtomicBool,
     pub last_status: RwLock<String>,
     pub last_error: RwLock<Option<String>>,
+    #[cfg(windows)]
+    pub cue_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    spoken_override: Mutex<Option<String>>,
     pub last_result: RwLock<String>,
     dialogue: Mutex<Vec<crate::generator::DialogueTurn>>,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
@@ -188,6 +191,9 @@ impl Runtime {
             platform,
             last_status: RwLock::new("Запускаю помощника".into()),
             last_error: RwLock::new(None),
+            #[cfg(windows)]
+            cue_worker: Mutex::new(None),
+            spoken_override: Mutex::new(None),
             last_result: RwLock::new(String::new()),
             dialogue: Mutex::new(Vec::new()),
         });
@@ -216,10 +222,13 @@ impl Runtime {
                     if matches!(&task, Task::Login | Task::RestartMusic) {
                         state.emit("clear_error", "");
                     }
+                    *state.spoken_override.lock().unwrap() = None;
                     match execute(&state, &mut music, task) {
                         Ok(message) => {
                             state.emit("info", &message);
-                            if state.snapshot().voice_feedback
+                            let reply = state.spoken_override.lock().unwrap().clone();
+                            if reply.as_deref() != Some("-")
+                                && state.snapshot().voice_feedback
                                 && message != "Ответ сохранён"
                                 && message != "Проверка голоса завершена"
                                 && !state.cancelled(confirmation_epoch)
@@ -234,7 +243,7 @@ impl Runtime {
                                     &message
                                 };
                                 if let Err(error) = state.platform.speak_configured(
-                                    brief,
+                                    reply.as_deref().unwrap_or(brief),
                                     &state.snapshot(),
                                     &|| state.cancelled(confirmation_epoch),
                                 ) {
@@ -305,6 +314,10 @@ impl Runtime {
         self.shared.set_muted(true);
         // Owns only the dedicated browser launched by this runtime. Do not leave it behind
         // when an HTTP generation request is still winding down during application exit.
+        #[cfg(windows)]
+        if let Some(worker) = self.shared.cue_worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
         self.browser_process.lock().unwrap().close();
     }
 }
@@ -395,8 +408,18 @@ fn present_answer(
     }
     state.emit("result", answer);
     state.emit("answer", answer);
-    if settings.voice_feedback && !state.capture_open.load(SeqCst) && !state.cancelled(epoch) {
-        let brief: String = spoken.chars().take(1200).collect();
+    let reply = state.spoken_override.lock().unwrap().clone();
+    if reply.as_deref() != Some("-")
+        && settings.voice_feedback
+        && !state.capture_open.load(SeqCst)
+        && !state.cancelled(epoch)
+    {
+        let brief: String = reply
+            .as_deref()
+            .unwrap_or(spoken)
+            .chars()
+            .take(1200)
+            .collect();
         state
             .platform
             .speak_configured(&brief, settings, &|| state.cancelled(epoch))?;
@@ -477,7 +500,9 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
                     | Command::VolumeDown
                     | Command::VolumeUp
             ) || matches!(&original, Command::Music { query, .. } if query.is_empty());
-            let repair_enabled = !immediate
+            let repair_enabled = (settings.recognition_speed != "fast"
+                || matches!(original, Command::Unknown(_)))
+                && !immediate
                 && !preview
                 && !dictating
                 && settings.llm_repair_speech
@@ -486,7 +511,13 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
                     Command::Disabled | Command::Invalid(_) | Command::Insert(_)
                 );
             let refined = samples
-                .filter(|_| !commands::time_sensitive(&original) || (repair_enabled && uncertain))
+                .filter(|_| match settings.recognition_speed.as_str() {
+                    "fast" => {
+                        dictating || matches!(original, Command::Unknown(_) | Command::Insert(_))
+                    }
+                    "precise" => true,
+                    _ => !commands::time_sensitive(&original) || (repair_enabled && uncertain),
+                })
                 .and_then(|samples| {
                     let refined = crate::speech::whisper_configured(&settings, &samples, || {
                         state.cancelled(epoch)
@@ -606,6 +637,14 @@ fn execute(state: &Shared, music: &mut dyn MusicServiceExt, task: Task) -> Resul
         }
         state.emit("status", "Выполняю команду");
     }
+    let repr = serde_json::to_value(&command)?;
+    let key = repr
+        .as_str()
+        .or_else(|| repr.as_object()?.keys().next().map(String::as_str));
+    *state.spoken_override.lock().unwrap() = key
+        .and_then(|k| settings.replies.get(k))
+        .filter(|s| !s.is_empty())
+        .cloned();
     match command {
         Command::Search(query) => { browser::open_external(&browser::search_url(&query))?; Ok("Открыт поиск в браузере".into()) }
         Command::WebAnswer(query) => {
@@ -810,6 +849,25 @@ mod tests {
             }
             runtime.close();
         }
+    }
+    #[test]
+    fn reply_preferences_apply_to_the_resolved_action() {
+        let mut settings = Settings::default();
+        settings.replies.insert("Pause".into(), "-".into());
+        settings.replies.insert("Resume".into(), "Поехали".into());
+        let runtime = Runtime::start(settings, Arc::new(Fake::default()), Arc::new(|_| {}));
+        for (phrase, expected) in [
+            ("пауза", Some("-")),
+            ("продолжи", Some("Поехали")),
+            ("следующий трек", None),
+        ] {
+            execute(&runtime.shared, &mut UnusedMusic, text_task(phrase)).unwrap();
+            assert_eq!(
+                runtime.shared.spoken_override.lock().unwrap().as_deref(),
+                expected
+            );
+        }
+        runtime.close();
     }
     #[test]
     fn disabled_fallback_and_invalid_commands_do_not_contact_a_model() {

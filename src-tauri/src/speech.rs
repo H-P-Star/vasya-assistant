@@ -120,6 +120,25 @@ impl Vosk {
         Ok(self.accept_transcript(samples)?.map(|(text, _)| text))
     }
 
+    pub fn partial(&self) -> String {
+        unsafe {
+            let Ok(read) = self
+                ._library
+                .get::<Text>(b"vosk_recognizer_partial_result\0")
+            else {
+                return String::new();
+            };
+            let p = read(self.recognizer.as_ptr());
+            if p.is_null() {
+                return String::new();
+            }
+            serde_json::from_slice::<serde_json::Value>(CStr::from_ptr(p).to_bytes())
+                .ok()
+                .and_then(|v| v["partial"].as_str().map(str::to_owned))
+                .unwrap_or_default()
+        }
+    }
+
     pub fn enable_word_confidence(&mut self) {
         unsafe {
             if let Ok(set_words) = self

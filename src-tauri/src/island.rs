@@ -88,7 +88,16 @@ pub fn update(app: &tauri::AppHandle, event: &Event) {
         return;
     }
     // Only an explicit wake/key activation opens the island. Logs and typed requests do not.
-    if event.kind == "activated" {
+    if matches!(event.kind.as_str(), "activated" | "wake_preview") {
+        if let Some(runtime) = app.try_state::<Runtime>() {
+            let s = runtime.shared.snapshot();
+            let _ = app.emit_to(
+                "island",
+                "island-style",
+                (s.island_bg, s.island_edge, s.island_mic, s.island_flat),
+            );
+        }
+        layout(app, false);
         state.revision.fetch_add(1, SeqCst);
         state.active.store(true, SeqCst);
         state.pinned.store(false, SeqCst);
@@ -97,7 +106,7 @@ pub fn update(app: &tauri::AppHandle, event: &Event) {
         {
             state.escape_owned.store(true, SeqCst);
         }
-        layout(app, false);
+
         let _ = app.emit_to("island", "island-layout", false);
         return;
     }
